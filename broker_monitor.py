@@ -242,6 +242,52 @@ def cli_backfill(n_days: int = 5):
     print(f"\n補抓完成：新增 {saved} 天，data/ 共 {total} 個快照")
 
 
+def cli_backfill_merge():
+    """對現有快照補抓缺漏分點（新增分點時使用），不刪除既有資料"""
+    branches = load_branches()
+    files = sorted(DATA_DIR.glob("*.json"), reverse=True)[:MAX_HISTORY]
+    if not files:
+        print("⚠️ 無現有快照，請先執行 --backfill"); return
+
+    updated = 0
+    for f in files:
+        snap     = json.loads(f.read_text("utf-8"))
+        date_str = snap["date"]
+        d_disp   = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
+        existing = set(snap.get("branches", {}).keys())
+        missing  = [b for b in branches if b["名稱"] not in existing]
+
+        if not missing:
+            print(f"  {d_disp}：分點完整，跳過")
+            continue
+
+        print(f"\n  📅 {d_disp}：補抓 {[b['名稱'] for b in missing]}")
+        any_ok = False
+        for br in missing:
+            print(f"    ▶ {br['名稱']}…", end=" ", flush=True)
+            html = fetch_html_dated(br["a"], br["b"], date_str)
+            stocks, ret_date = parse_buy_stocks(html)
+            if not ret_date:
+                print("⚠️ 無資料")
+                continue
+            snap["branches"][br["名稱"]] = [
+                {"ticker": s["ticker"], "name": s["name"],
+                 "buy": s["buy"], "sell": s["sell"], "net": s["net"]}
+                for s in stocks
+            ]
+            print(f"{len(stocks)} 筆")
+            any_ok = True
+
+        if any_ok:
+            f.write_text(
+                json.dumps(snap, ensure_ascii=False, separators=(',', ':')), "utf-8"
+            )
+            print(f"  ✅ {f.name} 已更新")
+            updated += 1
+
+    print(f"\n合併補抓完成：更新 {updated} 個快照")
+
+
 # ════════════════════════════════════════════════════════════
 # TWSE 三大法人（外資 / 投信）
 # ════════════════════════════════════════════════════════════
@@ -1123,6 +1169,8 @@ def main():
     # ── 分點管理 / 補抓 指令 ────────────────────────────────
     if "--list-branches" in args:
         cli_list_branches(); return
+    if "--backfill-merge" in args:
+        cli_backfill_merge(); return
     if "--backfill" in args:
         idx = args.index("--backfill")
         n   = int(args[idx + 1]) if idx + 1 < len(args) and args[idx + 1].isdigit() else 5
