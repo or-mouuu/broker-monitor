@@ -1,0 +1,54 @@
+name: 每日券商分點大額買進監控
+
+on:
+  schedule:
+    # 台灣時間 15:35（收盤後），UTC 07:35，週一至週五
+    - cron: "35 7 * * 1-5"
+    # 備援：台灣時間 16:10，以防資料略延遲
+    - cron: "10 8 * * 1-5"
+  workflow_dispatch:   # 允許手動觸發
+
+permissions:
+  contents: write      # 允許 push 到 gh-pages
+
+jobs:
+  fetch-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. 取得程式碼 ──────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. 設定 Python ────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. 安裝工具（curl + iconv 已內建 ubuntu-latest）─────
+      - name: Verify tools
+        run: |
+          curl --version | head -1
+          iconv --version | head -1
+
+      # ── 4. 執行監控腳本（產生 index.html + 寄信）─────────────
+      - name: Run broker monitor
+        env:
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          EMAIL_SENDER:    ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          python broker_monitor.py --email
+          echo "--- generated file size ---"
+          wc -c index.html
+
+      # ── 5. 部署 index.html 到 GitHub Pages ───────────────
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./
+          publish_branch: gh-pages
+          include_files: index.html
+          commit_message: "自動更新：$(date +'%Y/%m/%d %H:%M')"
