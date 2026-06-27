@@ -467,10 +467,12 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
 
     rows = ""
     for i, s in enumerate(stocks, 1):
-        tk      = s["ticker"]
-        mkt     = twse_vol.get(tk, 0)
-        pure    = ' <span class="tag-pure">純買</span>' if s["sell"] == 0 else ""
-        streak  = s.get("streak", 0)
+        tk       = s["ticker"]
+        mkt      = twse_vol.get(tk, 0)
+        pure     = ' <span class="tag-pure">純買</span>' if s["sell"] == 0 else ""
+        streak   = s.get("streak", 0)
+        spike_dv = f"{s['spike']:.2f}" if s.get('spike') else '0'
+        vol_dv   = f"{s['buy']/mkt*100:.3f}" if mkt else '0'
         rows += f"""<tr>
           <td>{i}</td>
           <td><strong>{tk}</strong></td>
@@ -479,9 +481,9 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
           <td class="r" data-v="{s['sell']}">{fmt_n(s['sell'])}{pure}</td>
           <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}</td>
           <td class="r" data-v="{s.get('avg_net',0):.0f}">{fmt_n(s.get('avg_net',0))}</td>
-          <td class="r" data-v="{s['spike']:.2f if s.get('spike') else 0}">{_spike_html(s.get('spike'))}</td>
+          <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
           <td class="r" data-v="{streak}">{_streak_html(streak)}</td>
-          <td class="r" data-v="{s['buy']/mkt*100 if mkt else 0:.3f}">{_vol_pct_html(s['buy'], mkt)}</td>
+          <td class="r" data-v="{vol_dv}">{_vol_pct_html(s['buy'], mkt)}</td>
         </tr>"""
 
     spk_cnt    = sum(1 for s in stocks if s.get("is_spike"))
