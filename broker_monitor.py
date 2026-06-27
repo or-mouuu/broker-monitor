@@ -245,7 +245,8 @@ def count_consecutive_buy_days(
 # 整合資料
 # ════════════════════════════════════════════════════════════
 
-def fetch_branch(branch: dict, history: list[dict]) -> dict:
+def fetch_branch(branch: dict) -> dict:
+    """抓取今日 + 五日資料，計算爆量倍率。連買天數由 main() 另行計算。"""
     a, b, name = branch["a"], branch["b"], branch["名稱"]
     print(f"  ▶ 抓取 {name}…", end=" ", flush=True)
     today_html   = fetch_html(a, b, days=1)
@@ -256,21 +257,29 @@ def fetch_branch(branch: dict, history: list[dict]) -> dict:
 
     merged = []
     for s in today_stocks:
-        tk  = s["ticker"]
-        fd  = fd_map.get(tk)
+        tk      = s["ticker"]
+        fd      = fd_map.get(tk)
         avg_net = (fd["net"] / 5) if fd else 0
         spike   = (s["net"] / avg_net) if avg_net > 0 else None
-        streak  = count_consecutive_buy_days(history, name, tk, s["net"])
         merged.append({
             **s,
             "avg_net":  avg_net,
             "spike":    spike,
             "is_spike": spike is not None and spike >= SPIKE_THRESHOLD,
-            "streak":   streak,
+            "streak":   0,   # 由 main() 確認 data_date 後填入
         })
 
     print(f"今日 {len(today_stocks)} 筆，五日 {len(fiveday_stocks)} 筆")
     return {"名稱": name, "stocks": merged, "data_date": data_date}
+
+
+def apply_streaks(all_branches: list[dict], history: list[dict]):
+    """已知 data_date 並過濾完歷史後，計算各分點各股的連買天數。"""
+    for br in all_branches:
+        for s in br["stocks"]:
+            s["streak"] = count_consecutive_buy_days(
+                history, br["名稱"], s["ticker"], s["net"]
+            )
 
 def build_consensus(all_branches: list[dict]) -> list[dict]:
     agg = defaultdict(lambda: {
@@ -617,20 +626,27 @@ def main():
     print("═" * 55)
 
     branches = load_branches()
-    history  = load_history()
-    print(f"  分點數：{len(branches)}，歷史快照：{len(history)} 日\n")
+    history_raw = load_history()   # 可能包含今天的快照（重跑時）
+    print(f"  分點數：{len(branches)}，歷史快照（含今日）：{len(history_raw)} 日\n")
 
-    # 抓取各分點資料
+    # 抓取各分點資料（不含連買，待確認 data_date 後才計算）
     all_branches = []
     for br in branches:
         try:
-            all_branches.append(fetch_branch(br, history))
+            all_branches.append(fetch_branch(br))
         except Exception as e:
             print(f"  ⚠️ {br['名稱']} 失敗：{e}")
     if not all_branches:
         print("❌ 所有分點失敗"); sys.exit(1)
 
     data_date = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
+
+    # 過濾歷史：排除與今天同一交易日的快照（重跑時避免雙重計算）
+    history = [h for h in history_raw if h.get("date") != data_date]
+    print(f"  有效歷史快照（排除今日）：{len(history)} 日")
+
+    # 計算連買天數（用過濾後的歷史）
+    apply_streaks(all_branches, history)
 
     # 儲存今日快照（供明日連買計算用）
     if data_date:
