@@ -537,7 +537,7 @@ def make_candle_svg(ohlc_list: list[dict], w: int = 72, h: int = 28) -> str:
         y_hi  = py(d["h"]); y_lo = py(d["l"])
         y_o   = py(d["o"]); y_c  = py(d["c"])
         y_top = min(y_o, y_c); bh = max(1.0, abs(y_o - y_c))
-        col   = "#16a34a" if d["c"] >= d["o"] else "#ef4444"
+        col   = "#ef4444" if d["c"] >= d["o"] else "#16a34a"
         parts.append(f'<line x1="{xc:.1f}" y1="{y_hi:.1f}" x2="{xc:.1f}" y2="{y_lo:.1f}" '
                      f'stroke="{col}" stroke-width="1"/>')
         parts.append(f'<rect x="{xl:.1f}" y="{y_top:.1f}" width="{body_w}" '
@@ -763,7 +763,7 @@ tr:hover td{background:#f8faff}
 /* ── Price cell (收盤+K線) ── */
 .price-cell{display:flex;align-items:center;gap:5px;justify-content:flex-end}
 .price-val{font-size:.8rem;font-weight:600;white-space:nowrap;min-width:46px;text-align:right}
-.price-up{color:#16a34a}.price-dn{color:#ef4444}.price-flat{color:#94a3b8}
+.price-up{color:#ef4444}.price-dn{color:#16a34a}.price-flat{color:#94a3b8}
 /* ── Buy sub (5日/10日) ── */
 .buy-sub{font-size:.64rem;color:#94a3b8;margin-top:.07rem;white-space:nowrap;line-height:1.3}
 /* ── Misc ── */
@@ -1003,7 +1003,7 @@ def render_branch_section(br: dict, twse_vol: dict,
         if _ohlc5:
             close  = _ohlc5[-1]["c"]
             prev_c = _ohlc5[-2]["c"] if len(_ohlc5) >= 2 else close
-            pcls   = "price-up" if close > prev_c else "price-dn" if close < prev_c else "price-flat"
+            pcls   = "price-dn" if close > prev_c else "price-up" if close < prev_c else "price-flat"
             price_dv   = f"{close:.2f}"
             price_html = (f'<div class="price-cell">'
                           f'<span class="price-val {pcls}">{close:,.1f}</span>'
