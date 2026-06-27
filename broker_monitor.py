@@ -28,14 +28,11 @@ BRANCHES_FILE = SCRIPT_DIR / "branches.json"
 DATA_DIR      = SCRIPT_DIR / "data"
 BROKER_JS_URL = "https://fubon-ebrokerdj.fbs.com.tw/z/js/zbrokerjs.djjs"
 FUBON_BASE    = "https://fubon-ebrokerdj.fbs.com.tw/z/zg/zgb/zgb0.djhtm"
-DETAIL_BASE   = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco0/zco0.djhtm"
 TWSE_API      = "https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date}&stockNo={ticker}"
 
-SPIKE_THRESHOLD      = 1.5    # 今日買超 / 五日均 ≥ 150% → 爆量
-MIN_NET_DISPLAY      = 3_000  # 最低顯示門檻（千元）
-MAX_HISTORY          = 20     # 最多回溯交易日數
-DETAIL_MIN_STREAK    = 3      # 連買 ≥N 日時抓 20 日明細
-DETAIL_MIN_ACCUM     = 5      # 積累中 ≥N/7 日時抓明細
+SPIKE_THRESHOLD = 1.5   # 今日買超 / 五日均 ≥ 150% → 爆量
+MIN_NET_DISPLAY = 3_000  # 最低顯示門檻（千元）
+MAX_HISTORY     = 20     # 最多回溯交易日數
 
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "or.mouuu@gmail.com")
 EMAIL_SENDER    = os.getenv("EMAIL_SENDER",    "")
@@ -297,160 +294,6 @@ def fetch_twse_volumes(
     return twse_vol, twse_monthly
 
 # ════════════════════════════════════════════════════════════
-# 個股 × 分點 20 日明細
-# ════════════════════════════════════════════════════════════
-
-def _parse_detail_html(html: str) -> list[dict]:
-    """解析 zco0 頁面：回傳 [{date, buy, sell, net}, ...] 最新→最舊"""
-    rows = re.findall(
-        r'<TD class="t4n0">(\d{4}/\d{2}/\d{2})</TD>(.*?)</tr>',
-        html, re.DOTALL | re.IGNORECASE
-    )
-    records = []
-    for date, rest in rows:
-        nums = re.findall(r't3[rn][01]"[^>]*>([\d\-,]+)', rest)
-        if len(nums) >= 4:
-            try:
-                records.append({
-                    "date": date.strip(),
-                    "buy":  int(nums[0].replace(",", "")),
-                    "sell": int(nums[1].replace(",", "")),
-                    "net":  int(nums[3].replace(",", "")),
-                })
-            except ValueError:
-                pass
-    return records
-
-def _fetch_one_detail(branch: dict, ticker: str) -> tuple[str, str, list[dict]]:
-    url = f"{DETAIL_BASE}?a={ticker}&b={branch['b']}&BHID={branch['a']}"
-    cmd = (f"curl -s --compressed "
-           f"-H 'Accept-Language: zh-TW,zh;q=0.9' -H 'User-Agent: Mozilla/5.0' "
-           f"'{url}' | iconv -f big5 -t utf-8 2>/dev/null")
-    html = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout
-    return branch["名稱"], ticker, _parse_detail_html(html)
-
-def fetch_all_details(
-    all_branches: list[dict]
-) -> dict[tuple[str, str], list[dict]]:
-    """並發抓取所有「重要信號」的 20 日明細（連買≥N 或積累高頻）"""
-    tasks: list[tuple[dict, str]] = []
-    for br in all_branches:
-        for s in br["stocks"]:
-            if s["net"] < MIN_NET_DISPLAY:
-                continue
-            if (s.get("streak", 0) >= DETAIL_MIN_STREAK or
-                    (s.get("is_accumulating") and s.get("buy_days", 0) >= DETAIL_MIN_ACCUM)):
-                tasks.append((br, s["ticker"]))
-
-    if not tasks:
-        return {}
-    print(f"  抓取 20 日明細（{len(tasks)} 組，並發 12）…", end=" ", flush=True)
-    result: dict[tuple[str, str], list[dict]] = {}
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        futures = {ex.submit(_fetch_one_detail, br, tk): (br["名稱"], tk)
-                   for br, tk in tasks}
-        for f in as_completed(futures):
-            br_name, tk, records = f.result()
-            if records:
-                result[(br_name, tk)] = records
-    print(f"成功 {len(result)}/{len(tasks)} 組")
-    return result
-
-
-def make_detail_bars(records: list[dict], w: int = 400, h: int = 70) -> str:
-    """20 日買超/賣超柱狀圖 SVG（records 最新→最舊，圖左舊→右新）"""
-    if not records:
-        return ""
-    recs = list(reversed(records))   # 最舊→最新
-    n    = len(recs)
-    nets = [r["net"] for r in recs]
-    buys = [r["buy"] for r in recs]
-    max_buy     = max(buys) or 1
-    max_net_abs = max(abs(v) for v in nets) or 1
-
-    bar_w = (w - 4) / n
-    mid   = h * 0.55   # 0 基線位置
-
-    parts = []
-    # 買進量底圖（淺藍）
-    for i, r in enumerate(recs):
-        x     = 2 + i * bar_w
-        buy_h = r["buy"] / max_buy * (h * 0.45)
-        parts.append(f'<rect x="{x:.1f}" y="{h-buy_h:.1f}" '
-                     f'width="{max(1,bar_w-1):.1f}" height="{buy_h:.1f}" '
-                     f'fill="#dbeafe" opacity="0.55"/>')
-    # 0 基線
-    parts.append(f'<line x1="0" y1="{mid}" x2="{w}" y2="{mid}" '
-                 f'stroke="#cbd5e1" stroke-width="0.8" stroke-dasharray="2,2"/>')
-    # 買超/賣超柱
-    for i, r in enumerate(recs):
-        x     = 2 + i * bar_w
-        net   = r["net"]
-        bar_h = abs(net) / max_net_abs * (mid - 6)
-        color = "#16a34a" if net >= 0 else "#ef4444"
-        y_top = (mid - bar_h) if net >= 0 else mid
-        parts.append(f'<rect x="{x:.1f}" y="{y_top:.1f}" '
-                     f'width="{max(1,bar_w-1):.1f}" height="{max(1,bar_h):.1f}" '
-                     f'fill="{color}" opacity="0.85"/>')
-    # 日期標籤（每5日 + 最後一日）
-    for i, r in enumerate(recs):
-        if i % 5 == 0 or i == n - 1:
-            x = 2 + i * bar_w + bar_w / 2
-            label = r["date"][5:] if r.get("date") else ""
-            parts.append(f'<text x="{x:.1f}" y="{h+10}" font-size="7.5" '
-                         f'fill="#94a3b8" text-anchor="middle">{label}</text>')
-
-    return (f'<svg viewBox="0 0 {w} {h+14}" width="{w}" height="{h+14}" '
-            f'style="display:block;margin:6px 0" xmlns="http://www.w3.org/2000/svg">'
-            + "".join(parts) + '</svg>')
-
-
-def render_detail_panel(
-    records: list[dict], branch_name: str, stock_ticker: str, stock_name: str
-) -> str:
-    if not records:
-        return ""
-    nets  = [r["net"]  for r in records]
-    buys  = [r["buy"]  for r in records]
-    sells = [r["sell"] for r in records]
-    buy_days  = sum(1 for n in nets if n > 0)
-    sell_days = sum(1 for n in nets if n < 0)
-    total_net = sum(nets)
-    avg_buy   = sum(buys) / len(buys)
-
-    recent5_net = sum(nets[:5])
-    momentum = "↑ 近5日加速" if recent5_net > total_net * 0.5 and total_net > 0 else \
-               "↓ 近5日趨緩" if recent5_net < total_net * 0.3 and total_net > 0 else ""
-
-    table_rows = ""
-    for r in records[:10]:
-        nc = "#16a34a;font-weight:600" if r["net"]>0 else ("color:#ef4444" if r["net"]<0 else "#888")
-        sign = "+" if r["net"] >= 0 else ""
-        table_rows += (f'<tr><td>{r["date"][5:]}</td>'
-                       f'<td class="r">{r["buy"]}</td>'
-                       f'<td class="r">{r["sell"]}</td>'
-                       f'<td class="r" style="color:{nc}">{sign}{r["net"]}</td></tr>')
-
-    return f"""<div class="detail-panel">
-      <div class="dp-meta">
-        <strong>{branch_name}</strong> × <strong>{stock_ticker} {stock_name}</strong>
-        — 近{len(records)}交易日明細（單位：張）
-        {f'<span class="tag-accum" style="margin-left:6px">{momentum}</span>' if momentum else ""}
-      </div>
-      <div class="dp-stats">
-        買超 <b>{buy_days}</b> 日 ／ 賣超 <b>{sell_days}</b> 日 ／
-        淨買超合計 <b style="color:{'#16a34a' if total_net>=0 else '#ef4444'}">{total_net:+,}</b> 張 ／
-        日均買進 <b>{avg_buy:.1f}</b> 張
-      </div>
-      {make_detail_bars(records)}
-      <table class="dp-tbl">
-        <thead><tr><th>日期</th><th class="r">買進(張)</th><th class="r">賣出(張)</th><th class="r">買超(張)</th></tr></thead>
-        <tbody>{table_rows}</tbody>
-      </table>
-    </div>"""
-
-
-# ════════════════════════════════════════════════════════════
 # 歷史資料（連買天數）
 # ════════════════════════════════════════════════════════════
 
@@ -676,74 +519,108 @@ def build_consensus(all_branches: list[dict]) -> list[dict]:
 
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Noto Sans TC',Arial,sans-serif;background:#f5f6f8;color:#1a1a2e;font-size:14px}
-header{background:#1a1a2e;color:#fff;padding:1.1rem 1.4rem;display:flex;justify-content:space-between;align-items:center}
-header h1{font-size:1.2rem;font-weight:600}
-header .meta{font-size:.78rem;opacity:.65;text-align:right;line-height:1.7}
-.container{max-width:1300px;margin:0 auto;padding:.9rem 1rem 3rem}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.7rem;margin:.9rem 0}
-.stat{background:#fff;border-radius:8px;padding:.8rem 1rem;border:1px solid #e8eaed}
-.stat .lbl{font-size:.72rem;color:#888;margin-bottom:.2rem}
-.stat .val{font-size:1.5rem;font-weight:600}
-.stat .sub{font-size:.68rem;color:#aaa;margin-top:.1rem}
-.tabs{display:flex;gap:.4rem;margin:1.1rem 0 0;border-bottom:2px solid #e8eaed;flex-wrap:wrap}
-.tab-btn{background:none;border:none;padding:.55rem 1.1rem;cursor:pointer;font-size:.88rem;
-  color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;border-radius:4px 4px 0 0;
-  font-family:inherit;white-space:nowrap;transition:color .12s,border-color .12s}
-.tab-btn:hover{color:#1a1a2e;background:#f0f2f5}
+body{font-family:'Noto Sans TC',system-ui,Arial,sans-serif;background:#f0f2f5;color:#1a1a2e;font-size:14px;line-height:1.4}
+/* ── Header ── */
+header{background:#1a1a2e;color:#fff;padding:.85rem 1.25rem;
+  display:flex;justify-content:space-between;align-items:center;
+  position:sticky;top:0;z-index:20;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+header h1{font-size:1rem;font-weight:600;letter-spacing:.01em}
+.meta{font-size:.68rem;opacity:.55;text-align:right;line-height:1.65}
+/* ── Layout ── */
+.container{max-width:1200px;margin:0 auto;padding:.85rem 1rem 3rem}
+/* ── Stats ── */
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:.55rem;margin:.75rem 0 1rem}
+.stat{background:#fff;border-radius:10px;padding:.65rem .9rem;
+  border:1px solid #e8eaed;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+.stat .lbl{font-size:.63rem;color:#999;text-transform:uppercase;letter-spacing:.04em;margin-bottom:.15rem}
+.stat .val{font-size:1.4rem;font-weight:700;line-height:1.1}
+.stat .sub{font-size:.62rem;color:#bbb;margin-top:.15rem}
+/* ── Tabs ── */
+.tabs{display:flex;margin:.6rem 0 0;border-bottom:2px solid #e8eaed;
+  overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.tabs::-webkit-scrollbar{display:none}
+.tab-btn{flex-shrink:0;background:none;border:none;padding:.5rem 1rem;cursor:pointer;
+  font-size:.82rem;color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;
+  font-family:inherit;white-space:nowrap;transition:color .1s,border-color .1s}
+.tab-btn:hover{color:#1a1a2e;background:#f7f8fa}
 .tab-btn.active{color:#2563eb;border-bottom-color:#2563eb;font-weight:600}
-.tab-panel{display:none;padding:.8rem 0}
+.tab-panel{display:none;padding:.75rem 0}
 .tab-panel.active{display:block}
-.tbl-wrap{overflow-x:auto;border-radius:8px;border:1px solid #e8eaed;background:#fff;margin-bottom:1.4rem}
+/* ── Table wrapper ── */
+.tbl-wrap{overflow-x:auto;border-radius:10px;border:1px solid #e8eaed;
+  background:#fff;margin-bottom:1.25rem;box-shadow:0 1px 4px rgba(0,0,0,.04)}
 table{width:100%;border-collapse:collapse;font-size:.82rem}
-th{background:#f8f9fb;color:#555;font-weight:600;padding:.55rem .8rem;text-align:left;
-   border-bottom:1px solid #e8eaed;white-space:nowrap}
-th button{background:none;border:none;cursor:pointer;font:inherit;color:inherit;padding:0;width:100%}
+th{background:#f8f9fb;color:#666;font-weight:600;padding:.5rem .8rem;text-align:left;
+   border-bottom:2px solid #e8eaed;white-space:nowrap;font-size:.73rem;letter-spacing:.02em}
 th.r,td.r{text-align:right}
-td{padding:.5rem .8rem;border-bottom:1px solid #f0f2f5;vertical-align:middle}
+td{padding:.5rem .8rem;border-bottom:1px solid #f2f3f5;vertical-align:middle}
 tr:last-child td{border-bottom:none}
-tr:hover td{background:#fafbff}
-.branch-section{margin-bottom:1.8rem}
-.branch-title{font-size:.95rem;font-weight:600;padding:.5rem 0 .45rem;
-  border-bottom:2px solid #2563eb;margin-bottom:.65rem;display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
-.br-chip{font-size:.68rem;background:#f0f2f5;color:#555;padding:.1rem .4rem;border-radius:4px;margin:.1rem .1rem 0}
-/* Badges */
-.cnt-badge{display:inline-block;padding:.15rem .45rem;border-radius:4px;font-weight:600;font-size:.78rem}
-.bc-all{background:#e8f0fe;color:#1a73e8}.bc-most{background:#e6f4ea;color:#137333}
-.bc-some{background:#fef7e0;color:#b06000}.bc-few{background:#f1efe8;color:#5f5e5a}
-.tag-spike{display:inline-block;background:#fce8e6;color:#c5221f;font-size:.66rem;padding:.1rem .38rem;border-radius:4px;font-weight:700}
-.tag-pure{display:inline-block;background:#e6f4ea;color:#137333;font-size:.66rem;padding:.1rem .38rem;border-radius:4px;font-weight:600}
-/* Streak badges */
-.streak-1{color:#aaa;font-size:.75rem}
-.streak-2,.streak-3{display:inline-block;background:#dbeafe;color:#1d4ed8;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:600}
-.streak-high{display:inline-block;background:#fef3c7;color:#92400e;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:700}
-.streak-vhigh{display:inline-block;background:#fee2e2;color:#991b1b;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:700}
-.det-btn{background:none;border:1px solid #93c5fd;border-radius:3px;padding:0 4px;
-  font-size:.65rem;cursor:pointer;margin-left:4px;color:#3b82f6;line-height:1.4}
-.det-btn:hover{background:#eff6ff}
-/* Detail panel */
-.detail-row td{padding:0!important;border-bottom:2px solid #2563eb}
-.detail-panel{background:#f8faff;padding:.75rem 1rem;border-radius:0 0 6px 6px}
-.dp-meta{font-size:.8rem;color:#333;margin-bottom:.4rem}
-.dp-stats{font-size:.75rem;color:#555;margin-bottom:.3rem}
-.dp-tbl{font-size:.75rem;width:auto;min-width:220px;margin-top:.4rem}
-.dp-tbl th{background:#f0f4ff;padding:.25rem .5rem;font-size:.72rem}
-.dp-tbl td{padding:.2rem .5rem;border-bottom:1px solid #f0f2f5}
-.dp-tbl td.r{text-align:right}
-.clickable-row{cursor:pointer}
-.clickable-row:hover td{background:#f0f7ff!important}
-/* Accumulation badge */
-.tag-accum{display:inline-block;background:#fff7ed;color:#c2410c;font-size:.66rem;padding:.1rem .38rem;border-radius:4px;font-weight:600}
-.dynamo-total{font-size:.67rem;color:#555;display:block;margin-top:.1rem;white-space:nowrap}
-.dynamo-wrap{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
-/* Market vol % */
-.vol-low{color:#aaa;font-size:.78rem}
-.vol-mid{color:#1d4ed8;font-size:.78rem;font-weight:500}
-.vol-high{color:#b45309;font-size:.78rem;font-weight:700}
-.vol-vhigh{color:#991b1b;font-size:.78rem;font-weight:700}
-.net-pos{color:#0a8043}
-.hint{font-size:.76rem;color:#888;margin-bottom:.65rem;line-height:1.6}
-@media(max-width:600px){.stats{grid-template-columns:1fr 1fr}td,th{padding:.4rem .55rem;font-size:.76rem}}
+tr:hover td{background:#f8faff}
+/* ── Ticker cell ── */
+.tk{display:flex;flex-direction:column;gap:.05rem}
+.tk-code{font-weight:700;font-size:.85rem;color:#1a1a2e;letter-spacing:.01em}
+.tk-name{font-size:.7rem;color:#999}
+/* ── Branch section ── */
+.branch-section{margin-bottom:1.5rem}
+.branch-title{font-size:.88rem;font-weight:600;padding:.4rem 0 .4rem;
+  border-bottom:2px solid #2563eb;margin-bottom:.6rem;
+  display:flex;align-items:center;gap:.35rem;flex-wrap:wrap}
+.br-chip{font-size:.64rem;background:#f0f2f5;color:#666;padding:.12rem .45rem;
+  border-radius:99px;white-space:nowrap}
+/* ── Signal tags (pill style) ── */
+.pill{display:inline-flex;align-items:center;padding:.12rem .45rem;
+  border-radius:99px;font-size:.66rem;font-weight:600;white-space:nowrap;line-height:1.4}
+.pill-blue{background:#eff6ff;color:#1d4ed8}
+.pill-amber{background:#fffbeb;color:#92400e}
+.pill-red{background:#fef2f2;color:#991b1b}
+.pill-orange{background:#fff7ed;color:#c2410c}
+.pill-green{background:#f0fdf4;color:#15803d}
+.pill-gray{background:#f1f3f4;color:#5f6368}
+/* ── Streak badges ── */
+.streak-1{color:#bbb;font-size:.72rem}
+.streak-2{display:inline-block;background:#eff6ff;color:#2563eb;font-size:.68rem;padding:.12rem .45rem;border-radius:99px;font-weight:600}
+.streak-high{display:inline-block;background:#fffbeb;color:#92400e;font-size:.68rem;padding:.12rem .45rem;border-radius:99px;font-weight:700}
+.streak-vhigh{display:inline-block;background:#fef2f2;color:#991b1b;font-size:.68rem;padding:.12rem .45rem;border-radius:99px;font-weight:700}
+/* ── Dynamo cell ── */
+.dynamo-wrap{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.dynamo-total{font-size:.64rem;color:#777;margin-top:.15rem;white-space:nowrap}
+/* ── Count badge (consensus) ── */
+.cnt-badge{display:inline-block;padding:.15rem .5rem;border-radius:99px;font-weight:700;font-size:.74rem}
+.bc-all{background:#e8f0fe;color:#1558d6}
+.bc-most{background:#e6f4ea;color:#137333}
+.bc-some{background:#fef7e0;color:#996300}
+.bc-few{background:#f1f3f4;color:#5f6368}
+/* ── Number colors ── */
+.net-pos{color:#15803d;font-weight:600}
+.spike-hi{color:#dc2626;font-weight:700}
+.spike-lo{color:#94a3b8}
+/* ── Market vol % ── */
+.vol-nd{color:#bbb;font-size:.76rem}
+.vol-lo{color:#64748b;font-size:.76rem}
+.vol-md{color:#1d4ed8;font-size:.76rem;font-weight:500}
+.vol-hi{color:#b45309;font-size:.76rem;font-weight:700}
+.vol-xh{color:#b91c1c;font-size:.76rem;font-weight:700}
+/* ── Misc ── */
+.hint{font-size:.73rem;color:#999;margin-bottom:.6rem;line-height:1.7;
+  padding:.4rem .7rem;background:#f8f9fb;border-radius:6px;border-left:3px solid #d1d5db}
+/* ── Mobile ── */
+@media(max-width:640px){
+  header{flex-direction:column;gap:.3rem;align-items:flex-start;padding:.7rem 1rem}
+  .meta{text-align:left}
+  .container{padding:.6rem .75rem 2rem}
+  .stats{grid-template-columns:repeat(3,1fr);gap:.4rem}
+  .stat{padding:.5rem .6rem}
+  .stat .val{font-size:1.15rem}
+  .stat .sub{display:none}
+  .tabs{margin:.4rem 0 0}
+  .tab-btn{padding:.45rem .75rem;font-size:.78rem}
+  th,td{padding:.4rem .55rem;font-size:.76rem}
+  .tk-name{display:none}
+  .col-hide{display:none}
+}
+@media(max-width:380px){
+  .stats{grid-template-columns:1fr 1fr}
+}
 """
 
 JS = """
@@ -754,25 +631,17 @@ function showTab(id){
   document.querySelector('[data-tab="'+id+'"]').classList.add('active');
 }
 function sortTable(th){
-  var table=th.closest('table'), idx=Array.from(th.parentElement.children).indexOf(th);
+  var tbl=th.closest('table'), col=Array.from(th.parentElement.children).indexOf(th);
   var isNum=th.dataset.num==='1', asc=th.dataset.asc==='1';
-  var rows=Array.from(table.querySelectorAll('tbody tr'));
+  var rows=Array.from(tbl.querySelectorAll('tbody tr'));
   rows.sort(function(a,b){
-    var av=a.cells[idx]?.dataset.v ?? a.cells[idx]?.textContent.trim() ?? '';
-    var bv=b.cells[idx]?.dataset.v ?? b.cells[idx]?.textContent.trim() ?? '';
+    var av=a.cells[col]?.dataset.v??a.cells[col]?.textContent.trim()??'';
+    var bv=b.cells[col]?.dataset.v??b.cells[col]?.textContent.trim()??'';
     return isNum?(asc?parseFloat(av)-parseFloat(bv):parseFloat(bv)-parseFloat(av))
                :(asc?av.localeCompare(bv,'zh-TW'):bv.localeCompare(av,'zh-TW'));
   });
   th.dataset.asc=asc?'0':'1';
-  rows.forEach(r=>table.querySelector('tbody').appendChild(r));
-}
-function toggleDetail(id){
-  var row=document.getElementById(id);
-  if(!row) return;
-  var vis=row.style.display==='table-row';
-  row.style.display=vis?'none':'table-row';
-  var btn=document.querySelector('[data-detail="'+id+'"]');
-  if(btn) btn.textContent=vis?'▶':'▼';
+  rows.forEach(r=>tbl.querySelector('tbody').appendChild(r));
 }
 """
 
@@ -784,86 +653,70 @@ def fmt_n(n, d=0):
 
 def _streak_html(streak: int) -> str:
     if streak <= 0: return '<span class="streak-1">–</span>'
-    if streak == 1: return '<span class="streak-1">今1日</span>'
-    if streak <= 3:  return f'<span class="streak-2">連{streak}日</span>'
-    if streak <= 5:  return f'<span class="streak-high">🔥連{streak}日</span>'
-    return f'<span class="streak-vhigh">🔴連{streak}日</span>'
+    if streak == 1: return '<span class="streak-1">今</span>'
+    if streak <= 3: return f'<span class="streak-2">連{streak}日</span>'
+    if streak <= 5: return f'<span class="streak-high">連{streak}日</span>'
+    return f'<span class="streak-vhigh">連{streak}日</span>'
 
-def _vol_pct_html(buy_k: int, market_k: int) -> str:
-    if market_k <= 0: return '<span class="vol-low">–</span>'
+def _vol_html(buy_k: int, market_k: int, title: str = "分點買進佔市場成交量") -> str:
+    if market_k <= 0: return '<span class="vol-nd">–</span>'
     pct = buy_k / market_k * 100
-    val = f"{pct:.2f}%"
-    if pct < 0.5:  cls = "vol-low"
-    elif pct < 2:  cls = "vol-mid"
-    elif pct < 5:  cls = "vol-high"
-    else:          cls = "vol-vhigh"
-    return f'<span class="{cls}" title="分點買進佔市場成交量">{val}</span>'
+    cls = "vol-nd" if pct < 0.1 else "vol-lo" if pct < 0.5 else "vol-md" if pct < 2 else "vol-hi" if pct < 5 else "vol-xh"
+    return f'<span class="{cls}" title="{title}">{pct:.2f}%</span>'
 
 def _spike_html(spike) -> str:
-    if spike is None: return '<span style="color:#bbb">–</span>'
-    cls = "color:#d93025;font-weight:700" if spike >= SPIKE_THRESHOLD else "color:#888"
-    tag = ' <span class="tag-spike">爆量</span>' if spike >= SPIKE_THRESHOLD else ""
-    return f'<span style="{cls}">{spike:.1f}x</span>{tag}'
+    if spike is None: return '<span class="spike-lo">–</span>'
+    if spike >= SPIKE_THRESHOLD:
+        return f'<span class="spike-hi">{spike:.1f}x</span> <span class="pill pill-red">爆量</span>'
+    return f'<span class="spike-lo">{spike:.1f}x</span>'
 
 def _dynamo_html(s: dict) -> str:
-    """籌碼動能欄：連買 or 積累信號 + 折線圖 + 累計量"""
-    streak     = s.get("streak", 0)
-    is_accum   = s.get("is_accumulating", False)
-    buy_days   = s.get("buy_days", 0)
-    win_days   = s.get("window_days", 0)
+    streak   = s.get("streak", 0)
+    is_accum = s.get("is_accumulating", False)
+    buy_days = s.get("buy_days", 0)
+    win_days = s.get("window_days", 0)
+    parts    = []
 
-    parts = []
-
-    # ── 連買（≥2日）：badge + 累計量 + sparkline ──
     if streak >= 2:
-        total  = s.get("streak_total", 0)
-        daily  = s.get("streak_daily", [])
-        badge  = _streak_html(streak)
-        spark  = make_sparkline(daily)
+        total = s.get("streak_total", 0)
+        daily = s.get("streak_daily", [])
         parts.append(
-            f'<div class="dynamo-wrap">{badge}{spark}</div>'
-            f'<span class="dynamo-total">連買累計 +{fmt_n(total)} 千</span>'
+            f'<div class="dynamo-wrap">{_streak_html(streak)}{make_sparkline(daily)}</div>'
+            f'<div class="dynamo-total">累計 +{fmt_n(total)} 千</div>'
         )
 
-    # ── 積累中（有缺口但高頻買進）：僅在 streak<2 時顯示，避免重複 ──
     if is_accum and streak < 2:
-        total  = s.get("window_buy_tot", 0)
-        daily  = s.get("all_daily", [])
-        badge  = f'<span class="tag-accum">積累中 {buy_days}/{win_days}日</span>'
-        spark  = make_sparkline(daily)
+        total = s.get("window_buy_tot", 0)
+        daily = s.get("all_daily", [])
+        badge = f'<span class="pill pill-orange">積累 {buy_days}/{win_days}日</span>'
         parts.append(
-            f'<div class="dynamo-wrap">{badge}{spark}</div>'
-            f'<span class="dynamo-total">近期累計 +{fmt_n(total)} 千</span>'
+            f'<div class="dynamo-wrap">{badge}{make_sparkline(daily)}</div>'
+            f'<div class="dynamo-total">窗口 +{fmt_n(total)} 千</div>'
         )
 
-    if not parts:
-        return _streak_html(streak)   # 今1日 or –
-
-    return "".join(parts)
+    return "".join(parts) if parts else _streak_html(streak)
 
 def _consensus_dynamo_html(s: dict) -> str:
-    """共識表格的籌碼動能欄：最長連買 + 合計 sparkline + 積累分點數"""
     streak       = s.get("max_streak", 0)
     streak_total = s.get("max_streak_total", 0)
     accum_br     = s.get("accum_branches", 0)
     combined     = s.get("combined_daily", [])
+    parts        = []
 
-    parts = []
     if streak >= 2:
         parts.append(
-            f'<div class="dynamo-wrap">{_streak_html(streak)}'
-            f'{make_sparkline(combined, w=70)}</div>'
-            f'<span class="dynamo-total">連買累計 +{fmt_n(streak_total)} 千</span>'
+            f'<div class="dynamo-wrap">{_streak_html(streak)}{make_sparkline(combined, w=70)}</div>'
+            f'<div class="dynamo-total">累計 +{fmt_n(streak_total)} 千</div>'
         )
     elif streak == 1:
         parts.append(_streak_html(1))
 
     if accum_br > 0:
-        tag = f'<span class="tag-accum">積累中 ×{accum_br}分點</span>'
+        tag = f'<span class="pill pill-orange">積累 ×{accum_br}</span>'
         if not parts:
             parts.append(f'<div class="dynamo-wrap">{tag}{make_sparkline(combined, w=70)}</div>')
         else:
-            parts.append(tag)
+            parts.append(f' {tag}')
 
     return "".join(parts) if parts else _streak_html(0)
 
@@ -873,68 +726,57 @@ def _bc_class(n, total):
 def render_consensus_table(consensus, total_branches, twse_vol):
     rows = ""
     for s in consensus:
-        br_html = "".join(f'<span class="br-chip">{b}</span>' for b in s["branches"])
+        br_html = " ".join(f'<span class="br-chip">{b}</span>' for b in s["branches"])
         ticker  = s["ticker"]
         mkt     = twse_vol.get(ticker, 0)
         bc_cls  = _bc_class(s["branch_count"], total_branches)
         cs      = s["cross_spike"]
         spike_s = f"{cs:.2f}" if cs else "0"
+        vol_dv  = f"{s['total_buy']/mkt*100:.3f}" if mkt else "0"
         rows += f"""<tr>
-          <td><strong>{ticker}</strong></td>
-          <td>{s['name']}</td>
-          <td class="r" data-v="{s['branch_count']}">
-            <span class="cnt-badge {bc_cls}">{s['branch_count']}/{total_branches}</span></td>
+          <td><div class="tk"><span class="tk-code">{ticker}</span><span class="tk-name">{s['name']}</span></div></td>
+          <td class="r" data-v="{s['branch_count']}"><span class="cnt-badge {bc_cls}">{s['branch_count']}/{total_branches}</span></td>
           <td class="r net-pos" data-v="{s['total_net']}">{fmt_n(s['total_net'])}</td>
-          <td class="r" data-v="{s['total_buy']}">{fmt_n(s['total_buy'])}</td>
-          <td class="r" data-v="{spike_s}">{_spike_html(cs)}</td>
+          <td class="r" data-v="{spike_s}" class="col-hide">{_spike_html(cs)}</td>
           <td data-v="{s['max_streak']}">{_consensus_dynamo_html(s)}</td>
-          <td class="r" data-v="{s['total_net']/mkt*100 if mkt else 0:.3f}">{_vol_pct_html(s['total_buy'], mkt)}</td>
-          <td>{br_html}</td>
+          <td class="r col-hide" data-v="{vol_dv}">{_vol_html(s['total_buy'], mkt)}</td>
+          <td class="col-hide">{br_html}</td>
         </tr>"""
     return f"""<div class="tbl-wrap"><table>
       <thead><tr>
-        <th onclick="sortTable(this)">代號 ↕</th>
-        <th onclick="sortTable(this)">名稱 ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)">分點數 ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)">總買超(千元) ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)">總買進(千元) ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)">跨分點倍率 ↕</th>
+        <th onclick="sortTable(this)">代號 / 名稱 ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)">分點 ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)">合計買超 ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)" class="col-hide">跨點倍率 ↕</th>
         <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
-        <th>買進分點</th>
+        <th class="r" data-num="1" onclick="sortTable(this) col-hide">佔市場量 ↕</th>
+        <th class="col-hide">買進分點</th>
       </tr></thead>
       <tbody>{rows}</tbody>
     </table></div>"""
 
 def _period_vol_pct_html(buy_gross: int, dates: list[str], ticker: str,
                          twse_monthly: dict, label: str) -> str:
-    """期間佔市場量 = 期間買進合計 / 期間市場成交合計"""
-    mkt_daily = twse_monthly.get(ticker, {})
-    mkt_sum   = sum(mkt_daily.get(d, 0) for d in dates)
-    if mkt_sum <= 0:
-        return '<span class="vol-low">–</span>'
-    pct = buy_gross / mkt_sum * 100
-    val = f"{pct:.2f}%"
-    cls = "vol-low" if pct < 0.5 else "vol-mid" if pct < 2 else "vol-high" if pct < 5 else "vol-vhigh"
-    return f'<span class="{cls}" title="{label}買進 {fmt_n(buy_gross)} ÷ 期間市場 {fmt_n(mkt_sum)} 千元">{val}📅</span>'
+    mkt_sum = sum(twse_monthly.get(ticker, {}).get(d, 0) for d in dates)
+    title   = f"{label}買進 {fmt_n(buy_gross)} ÷ 期間市場 {fmt_n(mkt_sum)} 千元"
+    return _vol_html(buy_gross, mkt_sum, title + "（📅期間）")
 
 def render_branch_section(br: dict, twse_vol: dict,
-                          details: dict | None = None,
                           twse_monthly: dict | None = None) -> str:
     stocks = [s for s in br["stocks"] if s["net"] >= MIN_NET_DISPLAY]
     if not stocks:
-        return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無顯著資料</span></div></div>'
+        return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無資料</span></div></div>'
 
     rows = ""
     for i, s in enumerate(stocks, 1):
         tk       = s["ticker"]
         mkt      = twse_vol.get(tk, 0)
-        pure     = ' <span class="tag-pure">純買</span>' if s["sell"] == 0 else ""
         streak   = s.get("streak", 0)
-        spike_dv = f"{s['spike']:.2f}" if s.get('spike') else '0'
-
-        # 佔市場量：連買或積累中改用期間合計
         is_accum = s.get("is_accumulating", False)
+        spike_dv = f"{s['spike']:.2f}" if s.get("spike") else "0"
+        pure_tag = ' <span class="pill pill-green">純買</span>' if s["sell"] == 0 else ""
+
+        # 佔市場量：連買或積累中用期間合計
         if twse_monthly and (is_accum or streak >= 2):
             if is_accum:
                 _buy_g = s.get("window_buy_gross", 0)
@@ -948,62 +790,42 @@ def render_branch_section(br: dict, twse_vol: dict,
             _mkt_sum = sum(twse_monthly.get(tk, {}).get(d, 0) for d in _dates)
             vol_dv   = f"{_buy_g / _mkt_sum * 100:.3f}" if _mkt_sum > 0 else "0"
         else:
-            vol_html = _vol_pct_html(s['buy'], mkt)
-            vol_dv   = f"{s['buy']/mkt*100:.3f}" if mkt else '0'
+            vol_html = _vol_html(s["buy"], mkt)
+            vol_dv   = f"{s['buy']/mkt*100:.3f}" if mkt else "0"
 
-        # 有 20 日明細時加展開按鈕
-        rec_key  = (br["名稱"], tk)
-        has_det  = details is not None and rec_key in details
-        det_id   = f"det-{br['名稱']}-{tk}".replace(" ", "").replace("-", "_")
-        expand_btn = (f'<button class="det-btn" data-detail="{det_id}" '
-                      f'onclick="toggleDetail(\'{det_id}\')" title="展開20日明細">▶</button>'
-                      if has_det else "")
-        rows += f"""<tr class="{'clickable-row' if has_det else ''}"{'onclick="toggleDetail(\''+det_id+'\')"' if has_det else ''}>
-          <td>{i}{expand_btn}</td>
-          <td><strong>{tk}</strong></td>
-          <td>{s['name']}</td>
-          <td class="r" data-v="{s['buy']}">{fmt_n(s['buy'])}</td>
-          <td class="r" data-v="{s['sell']}">{fmt_n(s['sell'])}{pure}</td>
-          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}</td>
-          <td class="r" data-v="{s.get('avg_net',0):.0f}">{fmt_n(s.get('avg_net',0))}</td>
+        rows += f"""<tr>
+          <td class="r" style="color:#bbb;font-size:.72rem;width:28px">{i}</td>
+          <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{s['name']}</span></div></td>
+          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
           <td data-v="{streak}">{_dynamo_html(s)}</td>
-          <td class="r" data-v="{vol_dv}">{vol_html}</td>
+          <td class="r col-hide" data-v="{vol_dv}">{vol_html}</td>
         </tr>"""
-        if has_det:
-            panel = render_detail_panel(details[rec_key], br["名稱"], tk, s["name"])
-            rows += (f'<tr id="{det_id}" class="detail-row" style="display:none">'
-                     f'<td colspan="10">{panel}</td></tr>')
 
     spk_cnt    = sum(1 for s in stocks if s.get("is_spike"))
     streak_max = max((s.get("streak", 0) for s in stocks), default=0)
     accum_cnt  = sum(1 for s in stocks if s.get("is_accumulating"))
-    badges     = []
-    if spk_cnt:    badges.append(f'<span class="br-chip">🔥 {spk_cnt} 爆量</span>')
-    if streak_max >= 3: badges.append(f'<span class="br-chip">📈 連買 {streak_max} 日</span>')
-    if accum_cnt:  badges.append(f'<span class="br-chip">🟠 積累中 {accum_cnt} 檔</span>')
+    badges = []
+    if spk_cnt:         badges.append(f'<span class="br-chip">🔥 {spk_cnt} 爆量</span>')
+    if streak_max >= 3: badges.append(f'<span class="br-chip">連買 {streak_max} 日</span>')
+    if accum_cnt:       badges.append(f'<span class="br-chip">積累 {accum_cnt} 檔</span>')
     return f"""<div class="branch-section">
       <div class="branch-title">{br['名稱']} {''.join(badges)}</div>
       <div class="tbl-wrap"><table>
         <thead><tr>
-          <th data-num="1" onclick="sortTable(this)"># ↕</th>
-          <th onclick="sortTable(this)">代號 ↕</th>
-          <th onclick="sortTable(this)">名稱 ↕</th>
-          <th class="r" data-num="1" onclick="sortTable(this)">買進(千元) ↕</th>
-          <th class="r" data-num="1" onclick="sortTable(this)">賣出(千元) ↕</th>
-          <th class="r" data-num="1" onclick="sortTable(this)">今日買超 ↕</th>
-          <th class="r" data-num="1" onclick="sortTable(this)">5日均買超 ↕</th>
+          <th style="width:28px">#</th>
+          <th onclick="sortTable(this)">代號 / 名稱 ↕</th>
+          <th class="r" data-num="1" onclick="sortTable(this)">今日買超(千) ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">今/均倍率 ↕</th>
           <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
-          <th class="r" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
+          <th class="r col-hide" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
         </tr></thead>
         <tbody>{rows}</tbody>
       </table></div>
     </div>"""
 
 def render_html(all_branches: list[dict], consensus: list[dict],
-                twse_vol: dict, details: dict | None = None,
-                twse_monthly: dict | None = None) -> str:
+                twse_vol: dict, twse_monthly: dict | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
@@ -1027,7 +849,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     for b in all_branches:
         tid = f"br-{b['名稱']}"
         tab_nav += f'<button class="tab-btn" data-tab="{tid}" onclick="showTab(\'{tid}\')">{b["名稱"]}</button>'
-        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, details, twse_monthly)}</div>'
+        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, twse_monthly)}</div>'
 
     vol_note = f"（TWSE 成交量已載入 {len(twse_vol)} 檔，佔市場量 % 供參考，上櫃個股可能無資料）" if twse_vol else "（TWSE 成交量載入失敗，佔市場量 % 不顯示）"
 
@@ -1173,11 +995,8 @@ def main():
         for bn, tk, nm, bd, wd, tot in sorted(accums, key=lambda x: -x[5])[:10]:
             print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
 
-    # 抓取重要信號的 20 日明細
-    details = fetch_all_details(all_branches)
-
     # 產生 HTML
-    html = render_html(all_branches, consensus, twse_vol, details, twse_monthly)
+    html = render_html(all_branches, consensus, twse_vol, twse_monthly)
     if save_file:
         out = SCRIPT_DIR / "index.html"
         out.write_text(html, "utf-8")
