@@ -339,17 +339,26 @@ def get_accumulation_data(
     回傳連買資訊、累計量、折線圖資料、積累信號。
     history 由新→舊，已排除今天的快照。
     """
-    # 收集窗口每天的 net / buy / date：today + 前 ACCUM_WINDOW-1 天
+    # 收集最多 10 天資料（today + 前 9 天）以支援 10 日累計，但積累邏輯仍用 ACCUM_WINDOW
+    COLLECT = max(ACCUM_WINDOW, 10)
     daily       = [today_net]
     daily_buy   = [today_buy]
     daily_dates = [today_date]
-    for day in history[: ACCUM_WINDOW - 1]:
+    for day in history[: COLLECT - 1]:
         stocks = day.get("branches", {}).get(branch_name, [])
         hit    = next((s for s in stocks if s["ticker"] == ticker), None)
         daily.append(hit["net"] if hit else 0)
         daily_buy.append(hit["buy"] if hit else 0)
         daily_dates.append(day.get("date", ""))
     # daily[0]=今, daily[-1]=最舊
+
+    # 10日累計（用前 10 筆，不足時取全部）
+    d10_net = sum(daily[:min(10, len(daily))])
+
+    # 積累邏輯僅看 ACCUM_WINDOW 內
+    daily = daily[:ACCUM_WINDOW]
+    daily_buy = daily_buy[:ACCUM_WINDOW]
+    daily_dates = daily_dates[:ACCUM_WINDOW]
 
     # 連買天數（從今天起連續正值）
     streak = 0
@@ -387,6 +396,7 @@ def get_accumulation_data(
         "window_dates":     window_dates,
         "is_accumulating":  is_accumulating,
         "all_daily":        all_daily,
+        "d10_net":          d10_net,
     }
 
 
@@ -436,13 +446,14 @@ def fetch_branch(branch: dict) -> dict:
         spike   = (s["net"] / avg_net) if avg_net > 0 else None
         merged.append({
             **s,
-            "avg_net":  avg_net,
-            "spike":    spike,
-            "is_spike": spike is not None and spike >= SPIKE_THRESHOLD,
+            "avg_net":     avg_net,
+            "fiveday_net": fd["net"] if fd else 0,  # 5日累計買超（千元）
+            "spike":       spike,
+            "is_spike":    spike is not None and spike >= SPIKE_THRESHOLD,
             # 以下由 apply_accumulation() 填入
             "streak": 0, "streak_total": 0, "streak_daily": [],
             "buy_days": 0, "window_days": 0, "window_buy_tot": 0,
-            "is_accumulating": False, "all_daily": [],
+            "is_accumulating": False, "all_daily": [], "d10_net": 0,
         })
 
     print(f"今日 {len(today_stocks)} 筆，五日 {len(fiveday_stocks)} 筆")
@@ -600,9 +611,35 @@ tr:hover td{background:#f8faff}
 .vol-md{color:#1d4ed8;font-size:.76rem;font-weight:500}
 .vol-hi{color:#b45309;font-size:.76rem;font-weight:700}
 .vol-xh{color:#b91c1c;font-size:.76rem;font-weight:700}
+/* ── Buy sub (5日/10日) ── */
+.buy-sub{font-size:.64rem;color:#94a3b8;margin-top:.07rem;white-space:nowrap;line-height:1.3}
 /* ── Misc ── */
 .hint{font-size:.73rem;color:#999;margin-bottom:.6rem;line-height:1.7;
   padding:.4rem .7rem;background:#f8f9fb;border-radius:6px;border-left:3px solid #d1d5db}
+/* ── Stats clickable ── */
+.stat.clickable{cursor:pointer;transition:box-shadow .15s,transform .1s}
+.stat.clickable:hover{box-shadow:0 3px 14px rgba(0,0,0,.11);transform:translateY(-1px)}
+/* ── Modal ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.46);z-index:100;
+  align-items:center;justify-content:center;padding:1rem}
+.modal-overlay.open{display:flex}
+.modal-box{background:#fff;border-radius:12px;max-width:560px;width:100%;
+  max-height:82vh;overflow:hidden;display:flex;flex-direction:column;
+  box-shadow:0 20px 60px rgba(0,0,0,.27)}
+.modal-hdr{padding:.65rem 1rem;border-bottom:1px solid #e8eaed;flex-shrink:0;
+  display:flex;justify-content:space-between;align-items:center;font-weight:600;font-size:.88rem}
+.modal-hdr button{background:none;border:none;cursor:pointer;font-size:1.05rem;
+  color:#999;padding:.15rem .4rem;line-height:1;border-radius:4px}
+.modal-hdr button:hover{background:#f0f2f5;color:#333}
+.modal-body{padding:.55rem .75rem;overflow-y:auto}
+.modal-list{display:flex;flex-direction:column;gap:.28rem}
+.modal-item{display:flex;align-items:center;gap:.35rem;padding:.38rem .55rem;
+  border-radius:7px;background:#f8f9fb;flex-wrap:wrap}
+.modal-item .tk-code{font-weight:700;font-size:.83rem;min-width:36px}
+.modal-item .tk-name{font-size:.72rem;color:#888;flex:1;min-width:60px}
+.modal-right{margin-left:auto;font-size:.76rem;font-weight:600;color:#1a1a2e;
+  white-space:nowrap;text-align:right}
+.modal-sub{font-size:.64rem;color:#999;margin-top:.08rem}
 /* ── Mobile ── */
 @media(max-width:640px){
   header{flex-direction:column;gap:.3rem;align-items:flex-start;padding:.7rem 1rem}
@@ -630,6 +667,13 @@ function showTab(id){
   document.getElementById(id).classList.add('active');
   document.querySelector('[data-tab="'+id+'"]').classList.add('active');
 }
+function openSignal(key,title){
+  document.getElementById('modal-title').textContent=title;
+  document.getElementById('modal-body').innerHTML=document.getElementById('_md-'+key).innerHTML;
+  document.getElementById('signal-modal').classList.add('open');
+}
+function closeModal(){document.getElementById('signal-modal').classList.remove('open');}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeModal();});
 function sortTable(th){
   var tbl=th.closest('table'), col=Array.from(th.parentElement.children).indexOf(th);
   var isNum=th.dataset.num==='1', asc=th.dataset.asc==='1';
@@ -776,6 +820,14 @@ def render_branch_section(br: dict, twse_vol: dict,
         spike_dv = f"{s['spike']:.2f}" if s.get("spike") else "0"
         pure_tag = ' <span class="pill pill-green">純買</span>' if s["sell"] == 0 else ""
 
+        # 5日/10日買超小字
+        fiveday = s.get("fiveday_net", 0)
+        d10     = s.get("d10_net", 0)
+        sub_parts = []
+        if fiveday > 0: sub_parts.append(f"5日 +{fmt_n(fiveday)}")
+        if d10 > 0:     sub_parts.append(f"10日 +{fmt_n(d10)}")
+        buy_sub = f'<div class="buy-sub">{" · ".join(sub_parts)}</div>' if sub_parts else ""
+
         # 佔市場量：連買或積累中用期間合計
         if twse_monthly and (is_accum or streak >= 2):
             if is_accum:
@@ -796,7 +848,7 @@ def render_branch_section(br: dict, twse_vol: dict,
         rows += f"""<tr>
           <td class="r" style="color:#bbb;font-size:.72rem;width:28px">{i}</td>
           <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{s['name']}</span></div></td>
-          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}</td>
+          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}{buy_sub}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
           <td data-v="{streak}">{_dynamo_html(s)}</td>
           <td class="r col-hide" data-v="{vol_dv}">{vol_html}</td>
@@ -824,6 +876,68 @@ def render_branch_section(br: dict, twse_vol: dict,
       </table></div>
     </div>"""
 
+def _build_modal_divs(all_branches: list[dict]) -> str:
+    """預建各 signal modal 內容（隱藏 div），由 openSignal() 複製到 modal-body"""
+
+    # ── 爆量個股 ──
+    spk_entries = sorted(
+        [(b["名稱"], s["ticker"], s["name"], s.get("spike") or 0, s["net"])
+         for b in all_branches for s in b["stocks"] if s.get("is_spike")],
+        key=lambda x: (-x[3], -x[4])
+    )
+    spk_items = "".join(
+        f'<div class="modal-item">'
+        f'<span class="tk-code">{tk}</span>'
+        f'<span class="tk-name">{nm}</span>'
+        f'<span class="br-chip">{br}</span>'
+        f'<div class="modal-right">{sp:.1f}x<br><span class="modal-sub">+{fmt_n(net)}千</span></div>'
+        f'</div>'
+        for br, tk, nm, sp, net in spk_entries
+    )
+
+    # ── 連買≥5日 ──
+    s5_entries = sorted(
+        [(b["名稱"], s["ticker"], s["name"], s.get("streak", 0), s.get("streak_total", 0))
+         for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5],
+        key=lambda x: (-x[3], -x[4])
+    )
+    s5_items = "".join(
+        f'<div class="modal-item">'
+        f'<span class="tk-code">{tk}</span>'
+        f'<span class="tk-name">{nm}</span>'
+        f'<span class="br-chip">{br}</span>'
+        f'<div class="modal-right">{_streak_html(d)}<br><span class="modal-sub">累計 +{fmt_n(tot)}千</span></div>'
+        f'</div>'
+        for br, tk, nm, d, tot in s5_entries
+    )
+
+    # ── 積累中（依密度排序：buy_days/window_days 高→低，再按 window_buy_tot）──
+    ac_entries = sorted(
+        [(b["名稱"], s["ticker"], s["name"],
+          s.get("buy_days", 0), s.get("window_days", 1), s.get("window_buy_tot", 0))
+         for b in all_branches for s in b["stocks"] if s.get("is_accumulating")],
+        key=lambda x: (-x[3] / x[4], -x[5])
+    )
+    ac_items = ""
+    for br, tk, nm, bd, wd, tot in ac_entries:
+        tier = '<span class="pill pill-amber">強積累</span> ' if bd >= 5 else ''
+        ac_items += (
+            f'<div class="modal-item">'
+            f'<span class="tk-code">{tk}</span>'
+            f'<span class="tk-name">{nm}</span>'
+            f'<span class="br-chip">{br}</span>'
+            f'{tier}<span class="pill pill-orange">{bd}/{wd}日</span>'
+            f'<div class="modal-right">+{fmt_n(tot)}千</div>'
+            f'</div>'
+        )
+
+    return (
+        f'<div id="_md-spikes" style="display:none"><div class="modal-list">{spk_items}</div></div>'
+        f'<div id="_md-streak5" style="display:none"><div class="modal-list">{s5_items}</div></div>'
+        f'<div id="_md-accum" style="display:none"><div class="modal-list">{ac_items}</div></div>'
+    )
+
+
 def render_html(all_branches: list[dict], consensus: list[dict],
                 twse_vol: dict, twse_monthly: dict | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
@@ -833,15 +947,23 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     spike_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_spike")]
     streak_5p   = [s for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5]
     accum_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_accumulating")]
+    accum_strong = sum(1 for s in accum_list if s.get("buy_days", 0) >= 5)
     total_buy_m = sum(s["buy"] for b in all_branches for s in b["stocks"]) // 1_000
+
+    modal_divs = _build_modal_divs(all_branches)
 
     stats = f"""<div class="stats">
       <div class="stat"><div class="lbl">資料日期</div><div class="val" style="font-size:1rem">{date_disp}</div></div>
       <div class="stat"><div class="lbl">監控分點</div><div class="val">{total_br}</div></div>
-      <div class="stat"><div class="lbl">共識買進</div><div class="val">{len(consensus)}</div><div class="sub">≥2分點同買</div></div>
-      <div class="stat"><div class="lbl">爆量個股</div><div class="val" style="color:#d93025">{len(spike_list)}</div><div class="sub">≥{int(SPIKE_THRESHOLD*100)}% 均量</div></div>
-      <div class="stat"><div class="lbl">連買≥5日</div><div class="val" style="color:#92400e">{len(streak_5p)}</div><div class="sub">強力信號</div></div>
-      <div class="stat"><div class="lbl">積累中</div><div class="val" style="color:#c2410c">{len(accum_list)}</div><div class="sub">有缺口但高頻買入</div></div>
+      <div class="stat clickable" onclick="showTab('consensus')" title="切換至共識買進分頁">
+        <div class="lbl">共識買進</div><div class="val">{len(consensus)}</div><div class="sub">≥2分點同買</div></div>
+      <div class="stat clickable" onclick="openSignal('spikes','爆量個股（{len(spike_list)}檔）')" title="點選查看名單">
+        <div class="lbl">爆量個股</div><div class="val" style="color:#d93025">{len(spike_list)}</div><div class="sub">≥{int(SPIKE_THRESHOLD*100)}% 均量 ↗</div></div>
+      <div class="stat clickable" onclick="openSignal('streak5','連買≥5日（{len(streak_5p)}檔）')" title="點選查看名單">
+        <div class="lbl">連買≥5日</div><div class="val" style="color:#92400e">{len(streak_5p)}</div><div class="sub">強力信號 ↗</div></div>
+      <div class="stat clickable" onclick="openSignal('accum','積累中（{len(accum_list)} 檔，強積累 {accum_strong}）')" title="點選查看名單，依頻率排序">
+        <div class="lbl">積累中</div><div class="val" style="color:#c2410c">{len(accum_list)}</div>
+        <div class="sub">強積累 {accum_strong} 檔 ↗</div></div>
     </div>"""
 
     tab_nav = ""
@@ -879,6 +1001,15 @@ def render_html(all_branches: list[dict], consensus: list[dict],
   </div>
   {panels}
 </div>
+<!-- Modal overlay -->
+<div id="signal-modal" class="modal-overlay" onclick="closeModal()">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div class="modal-hdr"><span id="modal-title"></span><button onclick="closeModal()">✕</button></div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+<!-- Modal data (hidden) -->
+{modal_divs}
 <script>{JS}</script>
 </body>
 </html>"""
