@@ -310,21 +310,79 @@ def load_history() -> list[dict]:
             pass
     return history
 
-def count_consecutive_buy_days(
+ACCUM_WINDOW   = 7                       # 積累觀察窗口（交易日）
+ACCUM_MIN_DAYS = 3                       # 至少幾天才算積累
+ACCUM_MIN_TOT  = MIN_NET_DISPLAY * 2    # 積累最低總量門檻
+
+def get_accumulation_data(
     history: list[dict], branch_name: str, ticker: str, today_net: int
-) -> int:
-    """計算（含今日）連續買超天數"""
-    streak = 1 if today_net > 0 else 0
-    if streak == 0:
-        return 0
-    for day in history:          # 昨日及更早，由新至舊
+) -> dict:
+    """
+    回傳連買資訊、累計量、折線圖資料、積累信號。
+    history 由新→舊，已排除今天的快照。
+    """
+    # 收集窗口每天的 net：today + 前 ACCUM_WINDOW-1 天
+    daily = [today_net]
+    for day in history[: ACCUM_WINDOW - 1]:
         stocks = day.get("branches", {}).get(branch_name, [])
-        hit = next((s for s in stocks if s["ticker"] == ticker), None)
-        if hit and hit["net"] > 0:
-            streak += 1
-        else:
-            break
-    return streak
+        hit    = next((s for s in stocks if s["ticker"] == ticker), None)
+        daily.append(hit["net"] if hit else 0)
+    # daily[0]=今, daily[-1]=最舊
+
+    # 連買天數（從今天起連續正值）
+    streak = 0
+    for n in daily:
+        if n > 0: streak += 1
+        else:     break
+
+    streak_daily    = list(reversed(daily[:streak]))  # 最舊→最新
+    streak_total    = sum(streak_daily)
+    buy_days        = sum(1 for n in daily if n > 0)
+    window_buy_tot  = sum(n for n in daily if n > 0)
+    all_daily       = list(reversed(daily))           # 最舊→最新
+
+    # 積累信號：窗口 ≥3 天有買、但非全連續（中間有缺口）
+    is_accumulating = (
+        buy_days  >= ACCUM_MIN_DAYS
+        and streak < buy_days          # 至少有一天缺口
+        and window_buy_tot >= ACCUM_MIN_TOT
+    )
+
+    return {
+        "streak":          streak,
+        "streak_total":    streak_total,
+        "streak_daily":    streak_daily,
+        "buy_days":        buy_days,
+        "window_days":     len(daily),
+        "window_buy_tot":  window_buy_tot,
+        "is_accumulating": is_accumulating,
+        "all_daily":       all_daily,
+    }
+
+
+def make_sparkline(daily: list[float], w: int = 64, h: int = 20) -> str:
+    """生成折線 SVG（daily: 最舊→最新的 net 值，千元）"""
+    n = len(daily)
+    if n < 2:
+        return ""
+    max_abs = max(abs(v) for v in daily) or 1
+    mid     = h / 2
+
+    xs = [round(1 + i / (n - 1) * (w - 2), 1) for i in range(n)]
+    ys = [round(mid - (v / max_abs) * (mid - 2), 1) for v in daily]
+
+    pts   = " ".join(f"{x},{y}" for x, y in zip(xs, ys))
+    color = "#16a34a" if daily[-1] > 0 else "#ef4444"
+    base  = f'<line x1="0" y1="{mid}" x2="{w}" y2="{mid}" stroke="#e2e8f0" stroke-width="0.8"/>'
+    line  = (f'<polyline points="{pts}" fill="none" stroke="{color}" '
+             f'stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>')
+    dots  = "".join(
+        f'<circle cx="{x}" cy="{y}" r="2" fill="{"#16a34a" if v>0 else "#ef4444" if v<0 else "#94a3b8"}"/>'
+        for x, y, v in zip(xs, ys, daily)
+    )
+    return (f'<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" '
+            f'style="vertical-align:middle;margin-left:3px;flex-shrink:0" '
+            f'xmlns="http://www.w3.org/2000/svg">{base}{line}{dots}</svg>')
 
 # ════════════════════════════════════════════════════════════
 # 整合資料
@@ -351,39 +409,50 @@ def fetch_branch(branch: dict) -> dict:
             "avg_net":  avg_net,
             "spike":    spike,
             "is_spike": spike is not None and spike >= SPIKE_THRESHOLD,
-            "streak":   0,   # 由 main() 確認 data_date 後填入
+            # 以下由 apply_accumulation() 填入
+            "streak": 0, "streak_total": 0, "streak_daily": [],
+            "buy_days": 0, "window_days": 0, "window_buy_tot": 0,
+            "is_accumulating": False, "all_daily": [],
         })
 
     print(f"今日 {len(today_stocks)} 筆，五日 {len(fiveday_stocks)} 筆")
     return {"名稱": name, "stocks": merged, "data_date": data_date}
 
 
-def apply_streaks(all_branches: list[dict], history: list[dict]):
-    """已知 data_date 並過濾完歷史後，計算各分點各股的連買天數。"""
+def apply_accumulation(all_branches: list[dict], history: list[dict]):
+    """已確認 data_date 並過濾今日後，計算各股籌碼動能資料。"""
     for br in all_branches:
         for s in br["stocks"]:
-            s["streak"] = count_consecutive_buy_days(
-                history, br["名稱"], s["ticker"], s["net"]
-            )
+            s.update(get_accumulation_data(history, br["名稱"], s["ticker"], s["net"]))
 
 def build_consensus(all_branches: list[dict]) -> list[dict]:
     agg = defaultdict(lambda: {
         "name": "", "branches": [], "total_buy": 0, "total_net": 0,
-        "total_avg_net": 0, "spike_count": 0, "max_streak": 0,
+        "total_avg_net": 0, "spike_count": 0,
+        "max_streak": 0, "max_streak_total": 0,
+        "accum_branches": 0,
+        "combined_daily": defaultdict(int),   # day_idx → combined net
     })
     for br in all_branches:
         for s in br["stocks"]:
             if s["net"] < MIN_NET_DISPLAY:
                 continue
             tk = s["ticker"]
-            agg[tk]["name"]          = s["name"]
+            agg[tk]["name"]           = s["name"]
             agg[tk]["branches"].append(br["名稱"])
-            agg[tk]["total_buy"]    += s["buy"]
-            agg[tk]["total_net"]    += s["net"]
+            agg[tk]["total_buy"]     += s["buy"]
+            agg[tk]["total_net"]     += s["net"]
             agg[tk]["total_avg_net"] += s.get("avg_net", 0)
             if s.get("is_spike"):
                 agg[tk]["spike_count"] += 1
-            agg[tk]["max_streak"] = max(agg[tk]["max_streak"], s.get("streak", 0))
+            streak = s.get("streak", 0)
+            if streak > agg[tk]["max_streak"]:
+                agg[tk]["max_streak"]       = streak
+                agg[tk]["max_streak_total"] = s.get("streak_total", 0)
+            if s.get("is_accumulating"):
+                agg[tk]["accum_branches"] += 1
+            for i, dn in enumerate(s.get("all_daily", [])):
+                agg[tk]["combined_daily"][i] += dn
 
     result = []
     for tk, v in agg.items():
@@ -391,17 +460,22 @@ def build_consensus(all_branches: list[dict]) -> list[dict]:
             continue
         cross_spike = (v["total_net"] / v["total_avg_net"]
                        if v["total_avg_net"] > 0 else None)
+        n_days = max(v["combined_daily"].keys()) + 1 if v["combined_daily"] else 0
+        combined = [v["combined_daily"].get(i, 0) for i in range(n_days)]
         result.append({
-            "ticker":       tk,
-            "name":         v["name"],
-            "branch_count": len(v["branches"]),
-            "branches":     v["branches"],
-            "total_buy":    v["total_buy"],
-            "total_net":    v["total_net"],
-            "cross_spike":  cross_spike,
-            "is_spike":     cross_spike is not None and cross_spike >= SPIKE_THRESHOLD,
-            "spike_count":  v["spike_count"],
-            "max_streak":   v["max_streak"],
+            "ticker":           tk,
+            "name":             v["name"],
+            "branch_count":     len(v["branches"]),
+            "branches":         v["branches"],
+            "total_buy":        v["total_buy"],
+            "total_net":        v["total_net"],
+            "cross_spike":      cross_spike,
+            "is_spike":         cross_spike is not None and cross_spike >= SPIKE_THRESHOLD,
+            "spike_count":      v["spike_count"],
+            "max_streak":       v["max_streak"],
+            "max_streak_total": v["max_streak_total"],
+            "accum_branches":   v["accum_branches"],
+            "combined_daily":   combined,
         })
     result.sort(key=lambda x: (-x["branch_count"], -x["total_net"]))
     return result
@@ -454,6 +528,10 @@ tr:hover td{background:#fafbff}
 .streak-2,.streak-3{display:inline-block;background:#dbeafe;color:#1d4ed8;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:600}
 .streak-high{display:inline-block;background:#fef3c7;color:#92400e;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:700}
 .streak-vhigh{display:inline-block;background:#fee2e2;color:#991b1b;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:700}
+/* Accumulation badge */
+.tag-accum{display:inline-block;background:#fff7ed;color:#c2410c;font-size:.66rem;padding:.1rem .38rem;border-radius:4px;font-weight:600}
+.dynamo-total{font-size:.67rem;color:#555;display:block;margin-top:.1rem;white-space:nowrap}
+.dynamo-wrap{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
 /* Market vol % */
 .vol-low{color:#aaa;font-size:.78rem}
 .vol-mid{color:#1d4ed8;font-size:.78rem;font-weight:500}
@@ -515,6 +593,68 @@ def _spike_html(spike) -> str:
     tag = ' <span class="tag-spike">爆量</span>' if spike >= SPIKE_THRESHOLD else ""
     return f'<span style="{cls}">{spike:.1f}x</span>{tag}'
 
+def _dynamo_html(s: dict) -> str:
+    """籌碼動能欄：連買 or 積累信號 + 折線圖 + 累計量"""
+    streak     = s.get("streak", 0)
+    is_accum   = s.get("is_accumulating", False)
+    buy_days   = s.get("buy_days", 0)
+    win_days   = s.get("window_days", 0)
+
+    parts = []
+
+    # ── 連買（≥2日）：badge + 累計量 + sparkline ──
+    if streak >= 2:
+        total  = s.get("streak_total", 0)
+        daily  = s.get("streak_daily", [])
+        badge  = _streak_html(streak)
+        spark  = make_sparkline(daily)
+        parts.append(
+            f'<div class="dynamo-wrap">{badge}{spark}</div>'
+            f'<span class="dynamo-total">連買累計 +{fmt_n(total)} 千</span>'
+        )
+
+    # ── 積累中（有缺口但高頻買進）：僅在 streak<2 時顯示，避免重複 ──
+    if is_accum and streak < 2:
+        total  = s.get("window_buy_tot", 0)
+        daily  = s.get("all_daily", [])
+        badge  = f'<span class="tag-accum">積累中 {buy_days}/{win_days}日</span>'
+        spark  = make_sparkline(daily)
+        parts.append(
+            f'<div class="dynamo-wrap">{badge}{spark}</div>'
+            f'<span class="dynamo-total">近期累計 +{fmt_n(total)} 千</span>'
+        )
+
+    if not parts:
+        return _streak_html(streak)   # 今1日 or –
+
+    return "".join(parts)
+
+def _consensus_dynamo_html(s: dict) -> str:
+    """共識表格的籌碼動能欄：最長連買 + 合計 sparkline + 積累分點數"""
+    streak       = s.get("max_streak", 0)
+    streak_total = s.get("max_streak_total", 0)
+    accum_br     = s.get("accum_branches", 0)
+    combined     = s.get("combined_daily", [])
+
+    parts = []
+    if streak >= 2:
+        parts.append(
+            f'<div class="dynamo-wrap">{_streak_html(streak)}'
+            f'{make_sparkline(combined, w=70)}</div>'
+            f'<span class="dynamo-total">連買累計 +{fmt_n(streak_total)} 千</span>'
+        )
+    elif streak == 1:
+        parts.append(_streak_html(1))
+
+    if accum_br > 0:
+        tag = f'<span class="tag-accum">積累中 ×{accum_br}分點</span>'
+        if not parts:
+            parts.append(f'<div class="dynamo-wrap">{tag}{make_sparkline(combined, w=70)}</div>')
+        else:
+            parts.append(tag)
+
+    return "".join(parts) if parts else _streak_html(0)
+
 def _bc_class(n, total):
     return "bc-all" if n == total else "bc-most" if n >= total*0.7 else "bc-some" if n >= 3 else "bc-few"
 
@@ -535,7 +675,7 @@ def render_consensus_table(consensus, total_branches, twse_vol):
           <td class="r net-pos" data-v="{s['total_net']}">{fmt_n(s['total_net'])}</td>
           <td class="r" data-v="{s['total_buy']}">{fmt_n(s['total_buy'])}</td>
           <td class="r" data-v="{spike_s}">{_spike_html(cs)}</td>
-          <td class="r" data-v="{s['max_streak']}">{_streak_html(s['max_streak'])}</td>
+          <td data-v="{s['max_streak']}">{_consensus_dynamo_html(s)}</td>
           <td class="r" data-v="{s['total_net']/mkt*100 if mkt else 0:.3f}">{_vol_pct_html(s['total_buy'], mkt)}</td>
           <td>{br_html}</td>
         </tr>"""
@@ -547,7 +687,7 @@ def render_consensus_table(consensus, total_branches, twse_vol):
         <th class="r" data-num="1" onclick="sortTable(this)">總買超(千元) ↕</th>
         <th class="r" data-num="1" onclick="sortTable(this)">總買進(千元) ↕</th>
         <th class="r" data-num="1" onclick="sortTable(this)">跨分點倍率 ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)">最長連買 ↕</th>
+        <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
         <th class="r" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
         <th>買進分點</th>
       </tr></thead>
@@ -576,15 +716,17 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
           <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}</td>
           <td class="r" data-v="{s.get('avg_net',0):.0f}">{fmt_n(s.get('avg_net',0))}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
-          <td class="r" data-v="{streak}">{_streak_html(streak)}</td>
+          <td data-v="{streak}">{_dynamo_html(s)}</td>
           <td class="r" data-v="{vol_dv}">{_vol_pct_html(s['buy'], mkt)}</td>
         </tr>"""
 
     spk_cnt    = sum(1 for s in stocks if s.get("is_spike"))
     streak_max = max((s.get("streak", 0) for s in stocks), default=0)
+    accum_cnt  = sum(1 for s in stocks if s.get("is_accumulating"))
     badges     = []
     if spk_cnt:    badges.append(f'<span class="br-chip">🔥 {spk_cnt} 爆量</span>')
-    if streak_max >= 3: badges.append(f'<span class="br-chip">📈 最長連買 {streak_max} 日</span>')
+    if streak_max >= 3: badges.append(f'<span class="br-chip">📈 連買 {streak_max} 日</span>')
+    if accum_cnt:  badges.append(f'<span class="br-chip">🟠 積累中 {accum_cnt} 檔</span>')
     return f"""<div class="branch-section">
       <div class="branch-title">{br['名稱']} {''.join(badges)}</div>
       <div class="tbl-wrap"><table>
@@ -597,7 +739,7 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
           <th class="r" data-num="1" onclick="sortTable(this)">今日買超 ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">5日均買超 ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">今/均倍率 ↕</th>
-          <th class="r" data-num="1" onclick="sortTable(this)">連買天數 ↕</th>
+          <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
         </tr></thead>
         <tbody>{rows}</tbody>
@@ -610,8 +752,9 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
     total_br   = len(all_branches)
-    spike_list = [s for b in all_branches for s in b["stocks"] if s.get("is_spike")]
-    streak_5p  = [s for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5]
+    spike_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_spike")]
+    streak_5p   = [s for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5]
+    accum_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_accumulating")]
     total_buy_m = sum(s["buy"] for b in all_branches for s in b["stocks"]) // 1_000
 
     stats = f"""<div class="stats">
@@ -619,8 +762,8 @@ def render_html(all_branches: list[dict], consensus: list[dict],
       <div class="stat"><div class="lbl">監控分點</div><div class="val">{total_br}</div></div>
       <div class="stat"><div class="lbl">共識買進</div><div class="val">{len(consensus)}</div><div class="sub">≥2分點同買</div></div>
       <div class="stat"><div class="lbl">爆量個股</div><div class="val" style="color:#d93025">{len(spike_list)}</div><div class="sub">≥{int(SPIKE_THRESHOLD*100)}% 均量</div></div>
-      <div class="stat"><div class="lbl">連買≥5日</div><div class="val" style="color:#92400e">{len(streak_5p)}</div><div class="sub">強度信號</div></div>
-      <div class="stat"><div class="lbl">各分點合計買進</div><div class="val" style="font-size:1rem">{total_buy_m:,}M</div><div class="sub">百萬元</div></div>
+      <div class="stat"><div class="lbl">連買≥5日</div><div class="val" style="color:#92400e">{len(streak_5p)}</div><div class="sub">強力信號</div></div>
+      <div class="stat"><div class="lbl">積累中</div><div class="val" style="color:#c2410c">{len(accum_list)}</div><div class="sub">有缺口但高頻買入</div></div>
     </div>"""
 
     tab_nav = ""
@@ -734,8 +877,8 @@ def main():
     history = [h for h in history_raw if h.get("date") != data_date]
     print(f"  有效歷史快照（排除今日）：{len(history)} 日")
 
-    # 計算連買天數（用過濾後的歷史）
-    apply_streaks(all_branches, history)
+    # 計算籌碼動能（連買天數 + 積累信號）
+    apply_accumulation(all_branches, history)
 
     # 儲存今日快照（供明日連買計算用）
     if data_date:
@@ -752,8 +895,10 @@ def main():
     # 爆量 + 連買摘要
     spikes  = [(b["名稱"], s["ticker"], s["name"], s["spike"])
                for b in all_branches for s in b["stocks"] if s.get("is_spike")]
-    streaks = [(b["名稱"], s["ticker"], s["name"], s["streak"])
+    streaks = [(b["名稱"], s["ticker"], s["name"], s["streak"], s.get("streak_total",0))
                for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 3]
+    accums  = [(b["名稱"], s["ticker"], s["name"], s["buy_days"], s.get("window_days",0), s.get("window_buy_tot",0))
+               for b in all_branches for s in b["stocks"] if s.get("is_accumulating")]
     if spikes:
         print(f"🔥 爆量（{len(spikes)} 筆）：")
         for bn, tk, nm, sp in sorted(spikes, key=lambda x: -(x[3] or 0))[:15]:
@@ -762,8 +907,12 @@ def main():
             print(f"   {bn} | {tk} {nm} | {sp:.1f}x")
     if streaks:
         print(f"\n📈 連買≥3日（{len(streaks)} 筆）：")
-        for bn, tk, nm, st in sorted(streaks, key=lambda x: -x[3])[:10]:
-            print(f"   {bn} | {tk} {nm} | 連{st}日")
+        for bn, tk, nm, st, tot in sorted(streaks, key=lambda x: -x[3])[:10]:
+            print(f"   {bn} | {tk} {nm} | 連{st}日 累計+{tot:,}千")
+    if accums:
+        print(f"\n🟠 積累中（{len(accums)} 筆）：")
+        for bn, tk, nm, bd, wd, tot in sorted(accums, key=lambda x: -x[5])[:10]:
+            print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
 
     # 產生 HTML
     html = render_html(all_branches, consensus, twse_vol)
