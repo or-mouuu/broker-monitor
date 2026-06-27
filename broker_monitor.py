@@ -243,6 +243,40 @@ def cli_backfill(n_days: int = 5):
 
 
 # ════════════════════════════════════════════════════════════
+# TWSE 三大法人（外資 / 投信）
+# ════════════════════════════════════════════════════════════
+
+FINI_MIN_LOTS = 500  # 低於此張數視為中性（張 = 千股）
+
+def fetch_fini(date_str: str) -> dict[str, dict]:
+    """抓取 TWSE T86 三大法人明細，回傳 {ticker: {"fini_net": 張, "trust_net": 張}}"""
+    url = (f"https://www.twse.com.tw/fund/T86?response=json"
+           f"&date={date_str}&selectType=ALL")
+    try:
+        out = subprocess.run(
+            ['curl', '-s', '--max-time', '15', '-H', 'User-Agent: Mozilla/5.0', url],
+            capture_output=True, text=True, timeout=20
+        ).stdout
+        data = json.loads(out)
+        if data.get("stat") != "OK":
+            print("  ⚠️ TWSE T86 無資料")
+            return {}
+        result: dict[str, dict] = {}
+        for row in data.get("data", []):
+            try:
+                tk        = row[0].strip()
+                fini_net  = int(row[4].replace(",", "")) // 1000
+                trust_net = int(row[10].replace(",", "")) // 1000
+                result[tk] = {"fini_net": fini_net, "trust_net": trust_net}
+            except Exception:
+                pass
+        print(f"  外資/投信資料：{len(result)} 檔")
+        return result
+    except Exception as e:
+        print(f"  ⚠️ fetch_fini 失敗：{e}")
+        return {}
+
+# ════════════════════════════════════════════════════════════
 # TWSE 成交量（佔市場比 %）
 # ════════════════════════════════════════════════════════════
 
@@ -764,6 +798,25 @@ def _consensus_dynamo_html(s: dict) -> str:
 
     return "".join(parts) if parts else _streak_html(0)
 
+def _fini_html(info: dict | None) -> str:
+    if not info:
+        return '<span class="fini-nd">–</span>'
+    fn, tn = info.get("fini_net", 0), info.get("trust_net", 0)
+    parts = []
+    if fn >= FINI_MIN_LOTS:
+        parts.append(f'<span class="pill pill-green" title="外資買超 +{fn:,}張">外資↑</span>')
+    elif fn <= -FINI_MIN_LOTS:
+        parts.append(f'<span class="pill pill-red" title="外資賣超 {fn:,}張">外資↓</span>')
+    if tn >= FINI_MIN_LOTS:
+        parts.append(f'<span class="pill pill-blue" title="投信買超 +{tn:,}張">投信↑</span>')
+    elif tn <= -FINI_MIN_LOTS:
+        parts.append(f'<span class="pill pill-amber" title="投信賣超 {tn:,}張">投信↓</span>')
+    if not parts:
+        return '<span class="fini-nd">–</span>'
+    # data-v：外資張數，用於排序
+    fini_dv = fn
+    return f'<span data-v="{fini_dv}">{"&nbsp;".join(parts)}</span>'
+
 def _bc_class(n, total):
     return "bc-all" if n == total else "bc-most" if n >= total*0.7 else "bc-some" if n >= 3 else "bc-few"
 
@@ -806,7 +859,8 @@ def _period_vol_pct_html(buy_gross: int, dates: list[str], ticker: str,
     return _vol_html(buy_gross, mkt_sum, title + "（📅期間）")
 
 def render_branch_section(br: dict, twse_vol: dict,
-                          twse_monthly: dict | None = None) -> str:
+                          twse_monthly: dict | None = None,
+                          fini_data: dict | None = None) -> str:
     stocks = [s for s in br["stocks"] if s["net"] >= MIN_NET_DISPLAY]
     if not stocks:
         return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無資料</span></div></div>'
@@ -820,13 +874,8 @@ def render_branch_section(br: dict, twse_vol: dict,
         spike_dv = f"{s['spike']:.2f}" if s.get("spike") else "0"
         pure_tag = ' <span class="pill pill-green">純買</span>' if s["sell"] == 0 else ""
 
-        # 5日/10日買超小字
         fiveday = s.get("fiveday_net", 0)
         d10     = s.get("d10_net", 0)
-        sub_parts = []
-        if fiveday > 0: sub_parts.append(f"5日 +{fmt_n(fiveday)}")
-        if d10 > 0:     sub_parts.append(f"10日 +{fmt_n(d10)}")
-        buy_sub = f'<div class="buy-sub">{" · ".join(sub_parts)}</div>' if sub_parts else ""
 
         # 佔市場量：連買或積累中用期間合計
         if twse_monthly and (is_accum or streak >= 2):
@@ -848,9 +897,12 @@ def render_branch_section(br: dict, twse_vol: dict,
         rows += f"""<tr>
           <td class="r" style="color:#bbb;font-size:.72rem;width:28px">{i}</td>
           <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{s['name']}</span></div></td>
-          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}{buy_sub}</td>
+          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}</td>
+          <td class="r" data-v="{fiveday}">{fmt_n(fiveday) if fiveday else '–'}</td>
+          <td class="r col-hide" data-v="{d10}">{fmt_n(d10) if d10 else '–'}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
           <td data-v="{streak}">{_dynamo_html(s)}</td>
+          <td class="col-hide" data-v="{fini_data.get(tk, {}).get('fini_net', 0) if fini_data else 0}">{_fini_html(fini_data.get(tk) if fini_data else None)}</td>
           <td class="r col-hide" data-v="{vol_dv}">{vol_html}</td>
         </tr>"""
 
@@ -868,8 +920,11 @@ def render_branch_section(br: dict, twse_vol: dict,
           <th style="width:28px">#</th>
           <th onclick="sortTable(this)">代號 / 名稱 ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">今日買超(千) ↕</th>
+          <th class="r" data-num="1" onclick="sortTable(this)">近5日(千) ↕</th>
+          <th class="r col-hide" data-num="1" onclick="sortTable(this)">近10日(千) ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">今/均倍率 ↕</th>
           <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
+          <th class="col-hide" data-num="1" onclick="sortTable(this)">外資/投信 ↕</th>
           <th class="r col-hide" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
         </tr></thead>
         <tbody>{rows}</tbody>
@@ -939,7 +994,8 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
 
 
 def render_html(all_branches: list[dict], consensus: list[dict],
-                twse_vol: dict, twse_monthly: dict | None = None) -> str:
+                twse_vol: dict, twse_monthly: dict | None = None,
+                fini_data: dict | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
@@ -971,7 +1027,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     for b in all_branches:
         tid = f"br-{b['名稱']}"
         tab_nav += f'<button class="tab-btn" data-tab="{tid}" onclick="showTab(\'{tid}\')">{b["名稱"]}</button>'
-        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, twse_monthly)}</div>'
+        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, twse_monthly, fini_data)}</div>'
 
     vol_note = f"（TWSE 成交量已載入 {len(twse_vol)} 檔，佔市場量 % 供參考，上櫃個股可能無資料）" if twse_vol else "（TWSE 成交量載入失敗，佔市場量 % 不顯示）"
 
@@ -1097,8 +1153,9 @@ def main():
     all_tickers = list({s["ticker"] for b in all_branches for s in b["stocks"]})
     if data_date:
         twse_vol, twse_monthly = fetch_twse_volumes(all_tickers, data_date)
+        fini_data = fetch_fini(data_date)
     else:
-        twse_vol, twse_monthly = {}, {}
+        twse_vol, twse_monthly, fini_data = {}, {}, {}
 
     # 共識分析
     consensus = build_consensus(all_branches)
@@ -1127,7 +1184,7 @@ def main():
             print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
 
     # 產生 HTML
-    html = render_html(all_branches, consensus, twse_vol, twse_monthly)
+    html = render_html(all_branches, consensus, twse_vol, twse_monthly, fini_data)
     if save_file:
         out = SCRIPT_DIR / "index.html"
         out.write_text(html, "utf-8")
