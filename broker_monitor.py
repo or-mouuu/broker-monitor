@@ -28,11 +28,14 @@ BRANCHES_FILE = SCRIPT_DIR / "branches.json"
 DATA_DIR      = SCRIPT_DIR / "data"
 BROKER_JS_URL = "https://fubon-ebrokerdj.fbs.com.tw/z/js/zbrokerjs.djjs"
 FUBON_BASE    = "https://fubon-ebrokerdj.fbs.com.tw/z/zg/zgb/zgb0.djhtm"
+DETAIL_BASE   = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco0/zco0.djhtm"
 TWSE_API      = "https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date}&stockNo={ticker}"
 
-SPIKE_THRESHOLD = 1.5   # 今日買超 / 五日均 ≥ 150% → 爆量
-MIN_NET_DISPLAY = 3_000  # 最低顯示門檻（千元）
-MAX_HISTORY     = 20     # 最多回溯交易日數
+SPIKE_THRESHOLD      = 1.5    # 今日買超 / 五日均 ≥ 150% → 爆量
+MIN_NET_DISPLAY      = 3_000  # 最低顯示門檻（千元）
+MAX_HISTORY          = 20     # 最多回溯交易日數
+DETAIL_MIN_STREAK    = 3      # 連買 ≥N 日時抓 20 日明細
+DETAIL_MIN_ACCUM     = 5      # 積累中 ≥N/7 日時抓明細
 
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "or.mouuu@gmail.com")
 EMAIL_SENDER    = os.getenv("EMAIL_SENDER",    "")
@@ -277,6 +280,160 @@ def fetch_twse_volumes(tickers: list[str], date_str: str) -> dict[str, int]:
     return volumes
 
 # ════════════════════════════════════════════════════════════
+# 個股 × 分點 20 日明細
+# ════════════════════════════════════════════════════════════
+
+def _parse_detail_html(html: str) -> list[dict]:
+    """解析 zco0 頁面：回傳 [{date, buy, sell, net}, ...] 最新→最舊"""
+    rows = re.findall(
+        r'<TD class="t4n0">(\d{4}/\d{2}/\d{2})</TD>(.*?)</tr>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    records = []
+    for date, rest in rows:
+        nums = re.findall(r't3[rn][01]"[^>]*>([\d\-,]+)', rest)
+        if len(nums) >= 4:
+            try:
+                records.append({
+                    "date": date.strip(),
+                    "buy":  int(nums[0].replace(",", "")),
+                    "sell": int(nums[1].replace(",", "")),
+                    "net":  int(nums[3].replace(",", "")),
+                })
+            except ValueError:
+                pass
+    return records
+
+def _fetch_one_detail(branch: dict, ticker: str) -> tuple[str, str, list[dict]]:
+    url = f"{DETAIL_BASE}?a={ticker}&b={branch['b']}&BHID={branch['a']}"
+    cmd = (f"curl -s --compressed "
+           f"-H 'Accept-Language: zh-TW,zh;q=0.9' -H 'User-Agent: Mozilla/5.0' "
+           f"'{url}' | iconv -f big5 -t utf-8 2>/dev/null")
+    html = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout
+    return branch["名稱"], ticker, _parse_detail_html(html)
+
+def fetch_all_details(
+    all_branches: list[dict]
+) -> dict[tuple[str, str], list[dict]]:
+    """並發抓取所有「重要信號」的 20 日明細（連買≥N 或積累高頻）"""
+    tasks: list[tuple[dict, str]] = []
+    for br in all_branches:
+        for s in br["stocks"]:
+            if s["net"] < MIN_NET_DISPLAY:
+                continue
+            if (s.get("streak", 0) >= DETAIL_MIN_STREAK or
+                    (s.get("is_accumulating") and s.get("buy_days", 0) >= DETAIL_MIN_ACCUM)):
+                tasks.append((br, s["ticker"]))
+
+    if not tasks:
+        return {}
+    print(f"  抓取 20 日明細（{len(tasks)} 組，並發 12）…", end=" ", flush=True)
+    result: dict[tuple[str, str], list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futures = {ex.submit(_fetch_one_detail, br, tk): (br["名稱"], tk)
+                   for br, tk in tasks}
+        for f in as_completed(futures):
+            br_name, tk, records = f.result()
+            if records:
+                result[(br_name, tk)] = records
+    print(f"成功 {len(result)}/{len(tasks)} 組")
+    return result
+
+
+def make_detail_bars(records: list[dict], w: int = 400, h: int = 70) -> str:
+    """20 日買超/賣超柱狀圖 SVG（records 最新→最舊，圖左舊→右新）"""
+    if not records:
+        return ""
+    recs = list(reversed(records))   # 最舊→最新
+    n    = len(recs)
+    nets = [r["net"] for r in recs]
+    buys = [r["buy"] for r in recs]
+    max_buy     = max(buys) or 1
+    max_net_abs = max(abs(v) for v in nets) or 1
+
+    bar_w = (w - 4) / n
+    mid   = h * 0.55   # 0 基線位置
+
+    parts = []
+    # 買進量底圖（淺藍）
+    for i, r in enumerate(recs):
+        x     = 2 + i * bar_w
+        buy_h = r["buy"] / max_buy * (h * 0.45)
+        parts.append(f'<rect x="{x:.1f}" y="{h-buy_h:.1f}" '
+                     f'width="{max(1,bar_w-1):.1f}" height="{buy_h:.1f}" '
+                     f'fill="#dbeafe" opacity="0.55"/>')
+    # 0 基線
+    parts.append(f'<line x1="0" y1="{mid}" x2="{w}" y2="{mid}" '
+                 f'stroke="#cbd5e1" stroke-width="0.8" stroke-dasharray="2,2"/>')
+    # 買超/賣超柱
+    for i, r in enumerate(recs):
+        x     = 2 + i * bar_w
+        net   = r["net"]
+        bar_h = abs(net) / max_net_abs * (mid - 6)
+        color = "#16a34a" if net >= 0 else "#ef4444"
+        y_top = (mid - bar_h) if net >= 0 else mid
+        parts.append(f'<rect x="{x:.1f}" y="{y_top:.1f}" '
+                     f'width="{max(1,bar_w-1):.1f}" height="{max(1,bar_h):.1f}" '
+                     f'fill="{color}" opacity="0.85"/>')
+    # 日期標籤（每5日 + 最後一日）
+    for i, r in enumerate(recs):
+        if i % 5 == 0 or i == n - 1:
+            x = 2 + i * bar_w + bar_w / 2
+            label = r["date"][5:] if r.get("date") else ""
+            parts.append(f'<text x="{x:.1f}" y="{h+10}" font-size="7.5" '
+                         f'fill="#94a3b8" text-anchor="middle">{label}</text>')
+
+    return (f'<svg viewBox="0 0 {w} {h+14}" width="{w}" height="{h+14}" '
+            f'style="display:block;margin:6px 0" xmlns="http://www.w3.org/2000/svg">'
+            + "".join(parts) + '</svg>')
+
+
+def render_detail_panel(
+    records: list[dict], branch_name: str, stock_ticker: str, stock_name: str
+) -> str:
+    if not records:
+        return ""
+    nets  = [r["net"]  for r in records]
+    buys  = [r["buy"]  for r in records]
+    sells = [r["sell"] for r in records]
+    buy_days  = sum(1 for n in nets if n > 0)
+    sell_days = sum(1 for n in nets if n < 0)
+    total_net = sum(nets)
+    avg_buy   = sum(buys) / len(buys)
+
+    recent5_net = sum(nets[:5])
+    momentum = "↑ 近5日加速" if recent5_net > total_net * 0.5 and total_net > 0 else \
+               "↓ 近5日趨緩" if recent5_net < total_net * 0.3 and total_net > 0 else ""
+
+    table_rows = ""
+    for r in records[:10]:
+        nc = "#16a34a;font-weight:600" if r["net"]>0 else ("color:#ef4444" if r["net"]<0 else "#888")
+        sign = "+" if r["net"] >= 0 else ""
+        table_rows += (f'<tr><td>{r["date"][5:]}</td>'
+                       f'<td class="r">{r["buy"]}</td>'
+                       f'<td class="r">{r["sell"]}</td>'
+                       f'<td class="r" style="color:{nc}">{sign}{r["net"]}</td></tr>')
+
+    return f"""<div class="detail-panel">
+      <div class="dp-meta">
+        <strong>{branch_name}</strong> × <strong>{stock_ticker} {stock_name}</strong>
+        — 近{len(records)}交易日明細（單位：張）
+        {f'<span class="tag-accum" style="margin-left:6px">{momentum}</span>' if momentum else ""}
+      </div>
+      <div class="dp-stats">
+        買超 <b>{buy_days}</b> 日 ／ 賣超 <b>{sell_days}</b> 日 ／
+        淨買超合計 <b style="color:{'#16a34a' if total_net>=0 else '#ef4444'}">{total_net:+,}</b> 張 ／
+        日均買進 <b>{avg_buy:.1f}</b> 張
+      </div>
+      {make_detail_bars(records)}
+      <table class="dp-tbl">
+        <thead><tr><th>日期</th><th class="r">買進(張)</th><th class="r">賣出(張)</th><th class="r">買超(張)</th></tr></thead>
+        <tbody>{table_rows}</tbody>
+      </table>
+    </div>"""
+
+
+# ════════════════════════════════════════════════════════════
 # 歷史資料（連買天數）
 # ════════════════════════════════════════════════════════════
 
@@ -416,7 +573,7 @@ def fetch_branch(branch: dict) -> dict:
         })
 
     print(f"今日 {len(today_stocks)} 筆，五日 {len(fiveday_stocks)} 筆")
-    return {"名稱": name, "stocks": merged, "data_date": data_date}
+    return {"名稱": name, "a": a, "b": b, "stocks": merged, "data_date": data_date}
 
 
 def apply_accumulation(all_branches: list[dict], history: list[dict]):
@@ -528,6 +685,20 @@ tr:hover td{background:#fafbff}
 .streak-2,.streak-3{display:inline-block;background:#dbeafe;color:#1d4ed8;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:600}
 .streak-high{display:inline-block;background:#fef3c7;color:#92400e;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:700}
 .streak-vhigh{display:inline-block;background:#fee2e2;color:#991b1b;font-size:.69rem;padding:.1rem .4rem;border-radius:4px;font-weight:700}
+.det-btn{background:none;border:1px solid #93c5fd;border-radius:3px;padding:0 4px;
+  font-size:.65rem;cursor:pointer;margin-left:4px;color:#3b82f6;line-height:1.4}
+.det-btn:hover{background:#eff6ff}
+/* Detail panel */
+.detail-row td{padding:0!important;border-bottom:2px solid #2563eb}
+.detail-panel{background:#f8faff;padding:.75rem 1rem;border-radius:0 0 6px 6px}
+.dp-meta{font-size:.8rem;color:#333;margin-bottom:.4rem}
+.dp-stats{font-size:.75rem;color:#555;margin-bottom:.3rem}
+.dp-tbl{font-size:.75rem;width:auto;min-width:220px;margin-top:.4rem}
+.dp-tbl th{background:#f0f4ff;padding:.25rem .5rem;font-size:.72rem}
+.dp-tbl td{padding:.2rem .5rem;border-bottom:1px solid #f0f2f5}
+.dp-tbl td.r{text-align:right}
+.clickable-row{cursor:pointer}
+.clickable-row:hover td{background:#f0f7ff!important}
 /* Accumulation badge */
 .tag-accum{display:inline-block;background:#fff7ed;color:#c2410c;font-size:.66rem;padding:.1rem .38rem;border-radius:4px;font-weight:600}
 .dynamo-total{font-size:.67rem;color:#555;display:block;margin-top:.1rem;white-space:nowrap}
@@ -561,6 +732,14 @@ function sortTable(th){
   });
   th.dataset.asc=asc?'0':'1';
   rows.forEach(r=>table.querySelector('tbody').appendChild(r));
+}
+function toggleDetail(id){
+  var row=document.getElementById(id);
+  if(!row) return;
+  var vis=row.style.display==='table-row';
+  row.style.display=vis?'none':'table-row';
+  var btn=document.querySelector('[data-detail="'+id+'"]');
+  if(btn) btn.textContent=vis?'▶':'▼';
 }
 """
 
@@ -694,7 +873,8 @@ def render_consensus_table(consensus, total_branches, twse_vol):
       <tbody>{rows}</tbody>
     </table></div>"""
 
-def render_branch_section(br: dict, twse_vol: dict) -> str:
+def render_branch_section(br: dict, twse_vol: dict,
+                          details: dict | None = None) -> str:
     stocks = [s for s in br["stocks"] if s["net"] >= MIN_NET_DISPLAY]
     if not stocks:
         return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無顯著資料</span></div></div>'
@@ -707,8 +887,15 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
         streak   = s.get("streak", 0)
         spike_dv = f"{s['spike']:.2f}" if s.get('spike') else '0'
         vol_dv   = f"{s['buy']/mkt*100:.3f}" if mkt else '0'
-        rows += f"""<tr>
-          <td>{i}</td>
+        # 有 20 日明細時加展開按鈕
+        rec_key  = (br["名稱"], tk)
+        has_det  = details is not None and rec_key in details
+        det_id   = f"det-{br['名稱']}-{tk}".replace(" ", "").replace("-", "_")
+        expand_btn = (f'<button class="det-btn" data-detail="{det_id}" '
+                      f'onclick="toggleDetail(\'{det_id}\')" title="展開20日明細">▶</button>'
+                      if has_det else "")
+        rows += f"""<tr class="{'clickable-row' if has_det else ''}"{'onclick="toggleDetail(\''+det_id+'\')"' if has_det else ''}>
+          <td>{i}{expand_btn}</td>
           <td><strong>{tk}</strong></td>
           <td>{s['name']}</td>
           <td class="r" data-v="{s['buy']}">{fmt_n(s['buy'])}</td>
@@ -719,6 +906,10 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
           <td data-v="{streak}">{_dynamo_html(s)}</td>
           <td class="r" data-v="{vol_dv}">{_vol_pct_html(s['buy'], mkt)}</td>
         </tr>"""
+        if has_det:
+            panel = render_detail_panel(details[rec_key], br["名稱"], tk, s["name"])
+            rows += (f'<tr id="{det_id}" class="detail-row" style="display:none">'
+                     f'<td colspan="10">{panel}</td></tr>')
 
     spk_cnt    = sum(1 for s in stocks if s.get("is_spike"))
     streak_max = max((s.get("streak", 0) for s in stocks), default=0)
@@ -747,7 +938,7 @@ def render_branch_section(br: dict, twse_vol: dict) -> str:
     </div>"""
 
 def render_html(all_branches: list[dict], consensus: list[dict],
-                twse_vol: dict) -> str:
+                twse_vol: dict, details: dict | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
@@ -771,7 +962,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     for b in all_branches:
         tid = f"br-{b['名稱']}"
         tab_nav += f'<button class="tab-btn" data-tab="{tid}" onclick="showTab(\'{tid}\')">{b["名稱"]}</button>'
-        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol)}</div>'
+        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, details)}</div>'
 
     vol_note = f"（TWSE 成交量已載入 {len(twse_vol)} 檔，佔市場量 % 供參考，上櫃個股可能無資料）" if twse_vol else "（TWSE 成交量載入失敗，佔市場量 % 不顯示）"
 
@@ -914,8 +1105,11 @@ def main():
         for bn, tk, nm, bd, wd, tot in sorted(accums, key=lambda x: -x[5])[:10]:
             print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
 
+    # 抓取重要信號的 20 日明細
+    details = fetch_all_details(all_branches)
+
     # 產生 HTML
-    html = render_html(all_branches, consensus, twse_vol)
+    html = render_html(all_branches, consensus, twse_vol, details)
     if save_file:
         out = SCRIPT_DIR / "index.html"
         out.write_text(html, "utf-8")
