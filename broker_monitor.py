@@ -762,7 +762,9 @@ tr:hover td{background:#f8faff}
 .vol-xh{color:#b91c1c;font-size:.76rem;font-weight:700}
 /* ── Price cell (收盤+K線) ── */
 .price-cell{display:flex;align-items:center;gap:5px;justify-content:flex-end}
-.price-val{font-size:.8rem;font-weight:600;white-space:nowrap;min-width:46px;text-align:right}
+.price-info{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
+.price-val{font-size:.8rem;font-weight:600;white-space:nowrap;text-align:right}
+.price-chg{font-size:.65rem;white-space:nowrap;text-align:right}
 .price-up{color:#ef4444}.price-dn{color:#16a34a}.price-flat{color:#94a3b8}
 /* ── Buy sub (5日/10日) ── */
 .buy-sub{font-size:.64rem;color:#94a3b8;margin-top:.07rem;white-space:nowrap;line-height:1.3}
@@ -1003,10 +1005,15 @@ def render_branch_section(br: dict, twse_vol: dict,
         if _ohlc5:
             close  = _ohlc5[-1]["c"]
             prev_c = _ohlc5[-2]["c"] if len(_ohlc5) >= 2 else close
+            chg_pct = (close - prev_c) / prev_c * 100 if prev_c else 0
             pcls   = "price-dn" if close > prev_c else "price-up" if close < prev_c else "price-flat"
+            chg_str = f'{chg_pct:+.2f}%'
             price_dv   = f"{close:.2f}"
             price_html = (f'<div class="price-cell">'
+                          f'<div class="price-info">'
                           f'<span class="price-val {pcls}">{close:,.1f}</span>'
+                          f'<span class="price-chg {pcls}">{chg_str}</span>'
+                          f'</div>'
                           f'{make_candle_svg(_ohlc5)}</div>')
         else:
             price_dv   = "0"
