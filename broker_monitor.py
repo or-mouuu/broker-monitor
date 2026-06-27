@@ -158,6 +158,91 @@ def parse_buy_stocks(html: str) -> tuple[list[dict], str]:
     return stocks, data_date
 
 # ════════════════════════════════════════════════════════════
+# 歷史補抓（backfill）
+# ════════════════════════════════════════════════════════════
+
+def _date_param(date_str: str) -> str:
+    """YYYYMMDD → YYYY-M-D（Fubon DJ 不補零）"""
+    return f"{date_str[:4]}-{int(date_str[4:6])}-{int(date_str[6:])}"
+
+def fetch_html_dated(a: str, b: str, date_str: str) -> str:
+    """抓取指定交易日（YYYYMMDD）單日資料"""
+    dp  = _date_param(date_str)
+    url = f"{FUBON_BASE}?a={a}&b={b}&c=B&e={dp}&f={dp}"
+    cmd = (
+        f"curl -s --compressed "
+        f"-H 'Accept-Language: zh-TW,zh;q=0.9' -H 'User-Agent: Mozilla/5.0' "
+        f"'{url}' | iconv -f big5 -t utf-8 2>/dev/null"
+    )
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout
+
+def get_recent_weekdays(n: int, skip: set) -> list[str]:
+    """從昨天往前找 n 個平日（週一~五），排除 skip 集合，回傳 YYYYMMDD 清單（新→舊）"""
+    from datetime import date, timedelta
+    result, d = [], date.today() - timedelta(days=1)
+    while len(result) < n:
+        s = d.strftime("%Y%m%d")
+        if d.weekday() < 5 and s not in skip:
+            result.append(s)
+        d -= timedelta(days=1)
+    return result
+
+def cli_backfill(n_days: int = 5):
+    """補抓最近 n_days 個交易日的單日快照（已有的自動跳過）"""
+    DATA_DIR.mkdir(exist_ok=True)
+    branches = load_branches()
+    existing = {f.stem for f in DATA_DIR.glob("*.json")}
+    # 候補清單（新→舊），多取一倍以應付假日
+    candidates = get_recent_weekdays(n_days * 3, skip=existing)
+
+    saved, tried = 0, 0
+    for date_str in candidates:   # 由新→舊，確保取最近 n 個交易日
+        if saved >= n_days:
+            break
+        tried += 1
+        d_disp = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
+        print(f"\n  📅 補抓 {d_disp}…")
+        branch_data: dict[str, list] = {}
+        actual_date = ""
+        is_trading_day = True
+
+        for br in branches:
+            print(f"    ▶ {br['名稱']}…", end=" ", flush=True)
+            html = fetch_html_dated(br["a"], br["b"], date_str)
+            stocks, ret_date = parse_buy_stocks(html)
+
+            if not ret_date:
+                # 回傳空日期 → 可能是假日，整天跳過
+                print("⚠️ 無資料（假日？）")
+                is_trading_day = False
+                break
+
+            actual_date = ret_date
+            print(f"{len(stocks)} 筆")
+            branch_data[br["名稱"]] = [
+                {"ticker": s["ticker"], "name": s["name"],
+                 "buy": s["buy"], "sell": s["sell"], "net": s["net"]}
+                for s in stocks
+            ]
+
+        if not is_trading_day:
+            print(f"  ↳ {d_disp} 為假日，跳過")
+            continue
+
+        path = DATA_DIR / f"{actual_date}.json"
+        path.write_text(
+            json.dumps({"date": actual_date, "branches": branch_data},
+                       ensure_ascii=False, separators=(',', ':')),
+            "utf-8"
+        )
+        print(f"  ✅ 已儲存 {path.name}")
+        saved += 1
+
+    total = len(list(DATA_DIR.glob("*.json")))
+    print(f"\n補抓完成：新增 {saved} 天，data/ 共 {total} 個快照")
+
+
+# ════════════════════════════════════════════════════════════
 # TWSE 成交量（佔市場比 %）
 # ════════════════════════════════════════════════════════════
 
@@ -606,9 +691,13 @@ def send_email(html: str, data_date: str):
 def main():
     args = sys.argv[1:]
 
-    # ── 分點管理指令 ────────────────────────────────────────
+    # ── 分點管理 / 補抓 指令 ────────────────────────────────
     if "--list-branches" in args:
         cli_list_branches(); return
+    if "--backfill" in args:
+        idx = args.index("--backfill")
+        n   = int(args[idx + 1]) if idx + 1 < len(args) and args[idx + 1].isdigit() else 5
+        cli_backfill(n); return
     if "--add" in args:
         idx = args.index("--add")
         url = args[idx + 1] if idx + 1 < len(args) else ""
