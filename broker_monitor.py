@@ -249,35 +249,52 @@ def cli_backfill(n_days: int = 5):
 # TWSE 成交量（佔市場比 %）
 # ════════════════════════════════════════════════════════════
 
-def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int]:
+def _roc_to_ymd(roc: str) -> str:
+    """民國日期 "115/06/26" → "20260626" """
+    p = roc.split("/")
+    return f"{int(p[0])+1911}{p[1]}{p[2]}"
+
+def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict[str, int]]:
+    """回傳 (ticker, 當日千元, {yyyymmdd: 千元} 整月)"""
     url = TWSE_API.format(date=date_str, ticker=ticker)
     try:
         out = subprocess.run(
             ['curl', '-s', '--max-time', '10', '-H', 'User-Agent: Mozilla/5.0', url],
             capture_output=True, text=True, timeout=15
         ).stdout
-        data = json.loads(out)
-        rows = data.get('data', [])
-        if rows:
-            # 欄位: [日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 筆數]
-            val_k = int(rows[-1][2].replace(',', '')) // 1000
-            return ticker, val_k
+        data  = json.loads(out)
+        rows  = data.get('data', [])
+        monthly: dict[str, int] = {}
+        for row in rows:
+            try:
+                ad = _roc_to_ymd(row[0])
+                monthly[ad] = int(row[2].replace(',', '')) // 1000
+            except Exception:
+                pass
+        today_val = monthly.get(date_str, (int(rows[-1][2].replace(',', '')) // 1000 if rows else 0))
+        return ticker, today_val, monthly
     except Exception:
         pass
-    return ticker, 0
+    return ticker, 0, {}
 
-def fetch_twse_volumes(tickers: list[str], date_str: str) -> dict[str, int]:
-    """並發抓取各股票當日 TWSE 成交金額（千元）"""
+def fetch_twse_volumes(
+    tickers: list[str], date_str: str
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    """並發抓取各股票 TWSE 成交金額。
+    回傳 (twse_vol={ticker:今日千元}, twse_monthly={ticker:{yyyymmdd:千元}})"""
     print(f"  載入 TWSE 成交量（{len(tickers)} 檔，並發 10）…", end=" ", flush=True)
-    volumes: dict[str, int] = {}
+    twse_vol: dict[str, int] = {}
+    twse_monthly: dict[str, dict[str, int]] = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(_fetch_one_volume, t, date_str): t for t in tickers}
         for f in as_completed(futures):
-            tk, val = f.result()
+            tk, val, monthly = f.result()
             if val > 0:
-                volumes[tk] = val
-    print(f"成功 {len(volumes)}/{len(tickers)} 檔")
-    return volumes
+                twse_vol[tk] = val
+            if monthly:
+                twse_monthly[tk] = monthly
+    print(f"成功 {len(twse_vol)}/{len(tickers)} 檔")
+    return twse_vol, twse_monthly
 
 # ════════════════════════════════════════════════════════════
 # 個股 × 分點 20 日明細
@@ -472,18 +489,23 @@ ACCUM_MIN_DAYS = 3                       # 至少幾天才算積累
 ACCUM_MIN_TOT  = MIN_NET_DISPLAY * 2    # 積累最低總量門檻
 
 def get_accumulation_data(
-    history: list[dict], branch_name: str, ticker: str, today_net: int
+    history: list[dict], branch_name: str, ticker: str,
+    today_net: int, today_buy: int = 0, today_date: str = ""
 ) -> dict:
     """
     回傳連買資訊、累計量、折線圖資料、積累信號。
     history 由新→舊，已排除今天的快照。
     """
-    # 收集窗口每天的 net：today + 前 ACCUM_WINDOW-1 天
-    daily = [today_net]
+    # 收集窗口每天的 net / buy / date：today + 前 ACCUM_WINDOW-1 天
+    daily       = [today_net]
+    daily_buy   = [today_buy]
+    daily_dates = [today_date]
     for day in history[: ACCUM_WINDOW - 1]:
         stocks = day.get("branches", {}).get(branch_name, [])
         hit    = next((s for s in stocks if s["ticker"] == ticker), None)
         daily.append(hit["net"] if hit else 0)
+        daily_buy.append(hit["buy"] if hit else 0)
+        daily_dates.append(day.get("date", ""))
     # daily[0]=今, daily[-1]=最舊
 
     # 連買天數（從今天起連續正值）
@@ -492,11 +514,15 @@ def get_accumulation_data(
         if n > 0: streak += 1
         else:     break
 
-    streak_daily    = list(reversed(daily[:streak]))  # 最舊→最新
-    streak_total    = sum(streak_daily)
-    buy_days        = sum(1 for n in daily if n > 0)
-    window_buy_tot  = sum(n for n in daily if n > 0)
-    all_daily       = list(reversed(daily))           # 最舊→最新
+    streak_daily      = list(reversed(daily[:streak]))       # 最舊→最新
+    streak_total      = sum(streak_daily)
+    streak_buy_gross  = sum(daily_buy[:streak])              # 期間買進合計（千元）
+    streak_dates      = list(reversed(daily_dates[:streak])) # 最舊→最新
+    buy_days          = sum(1 for n in daily if n > 0)
+    window_buy_tot    = sum(n for n in daily if n > 0)
+    window_buy_gross  = sum(b for b, n in zip(daily_buy, daily) if n > 0)
+    window_dates      = list(reversed([d for d, n in zip(daily_dates, daily) if n > 0]))
+    all_daily         = list(reversed(daily))                # 最舊→最新
 
     # 積累信號：窗口 ≥3 天有買、但非全連續（中間有缺口）
     is_accumulating = (
@@ -506,14 +532,18 @@ def get_accumulation_data(
     )
 
     return {
-        "streak":          streak,
-        "streak_total":    streak_total,
-        "streak_daily":    streak_daily,
-        "buy_days":        buy_days,
-        "window_days":     len(daily),
-        "window_buy_tot":  window_buy_tot,
-        "is_accumulating": is_accumulating,
-        "all_daily":       all_daily,
+        "streak":           streak,
+        "streak_total":     streak_total,
+        "streak_daily":     streak_daily,
+        "streak_buy_gross": streak_buy_gross,
+        "streak_dates":     streak_dates,
+        "buy_days":         buy_days,
+        "window_days":      len(daily),
+        "window_buy_tot":   window_buy_tot,
+        "window_buy_gross": window_buy_gross,
+        "window_dates":     window_dates,
+        "is_accumulating":  is_accumulating,
+        "all_daily":        all_daily,
     }
 
 
@@ -576,11 +606,14 @@ def fetch_branch(branch: dict) -> dict:
     return {"名稱": name, "a": a, "b": b, "stocks": merged, "data_date": data_date}
 
 
-def apply_accumulation(all_branches: list[dict], history: list[dict]):
+def apply_accumulation(all_branches: list[dict], history: list[dict], data_date: str = ""):
     """已確認 data_date 並過濾今日後，計算各股籌碼動能資料。"""
     for br in all_branches:
         for s in br["stocks"]:
-            s.update(get_accumulation_data(history, br["名稱"], s["ticker"], s["net"]))
+            s.update(get_accumulation_data(
+                history, br["名稱"], s["ticker"],
+                s["net"], s.get("buy", 0), data_date
+            ))
 
 def build_consensus(all_branches: list[dict]) -> list[dict]:
     agg = defaultdict(lambda: {
@@ -873,8 +906,21 @@ def render_consensus_table(consensus, total_branches, twse_vol):
       <tbody>{rows}</tbody>
     </table></div>"""
 
+def _period_vol_pct_html(buy_gross: int, dates: list[str], ticker: str,
+                         twse_monthly: dict, label: str) -> str:
+    """期間佔市場量 = 期間買進合計 / 期間市場成交合計"""
+    mkt_daily = twse_monthly.get(ticker, {})
+    mkt_sum   = sum(mkt_daily.get(d, 0) for d in dates)
+    if mkt_sum <= 0:
+        return '<span class="vol-low">–</span>'
+    pct = buy_gross / mkt_sum * 100
+    val = f"{pct:.2f}%"
+    cls = "vol-low" if pct < 0.5 else "vol-mid" if pct < 2 else "vol-high" if pct < 5 else "vol-vhigh"
+    return f'<span class="{cls}" title="{label}買進 {fmt_n(buy_gross)} ÷ 期間市場 {fmt_n(mkt_sum)} 千元">{val}📅</span>'
+
 def render_branch_section(br: dict, twse_vol: dict,
-                          details: dict | None = None) -> str:
+                          details: dict | None = None,
+                          twse_monthly: dict | None = None) -> str:
     stocks = [s for s in br["stocks"] if s["net"] >= MIN_NET_DISPLAY]
     if not stocks:
         return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無顯著資料</span></div></div>'
@@ -886,7 +932,25 @@ def render_branch_section(br: dict, twse_vol: dict,
         pure     = ' <span class="tag-pure">純買</span>' if s["sell"] == 0 else ""
         streak   = s.get("streak", 0)
         spike_dv = f"{s['spike']:.2f}" if s.get('spike') else '0'
-        vol_dv   = f"{s['buy']/mkt*100:.3f}" if mkt else '0'
+
+        # 佔市場量：連買或積累中改用期間合計
+        is_accum = s.get("is_accumulating", False)
+        if twse_monthly and (is_accum or streak >= 2):
+            if is_accum:
+                _buy_g = s.get("window_buy_gross", 0)
+                _dates = s.get("window_dates", [])
+                _label = f"積累{len(_dates)}日"
+            else:
+                _buy_g = s.get("streak_buy_gross", 0)
+                _dates = s.get("streak_dates", [])
+                _label = f"連買{streak}日"
+            vol_html = _period_vol_pct_html(_buy_g, _dates, tk, twse_monthly, _label)
+            _mkt_sum = sum(twse_monthly.get(tk, {}).get(d, 0) for d in _dates)
+            vol_dv   = f"{_buy_g / _mkt_sum * 100:.3f}" if _mkt_sum > 0 else "0"
+        else:
+            vol_html = _vol_pct_html(s['buy'], mkt)
+            vol_dv   = f"{s['buy']/mkt*100:.3f}" if mkt else '0'
+
         # 有 20 日明細時加展開按鈕
         rec_key  = (br["名稱"], tk)
         has_det  = details is not None and rec_key in details
@@ -904,7 +968,7 @@ def render_branch_section(br: dict, twse_vol: dict,
           <td class="r" data-v="{s.get('avg_net',0):.0f}">{fmt_n(s.get('avg_net',0))}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
           <td data-v="{streak}">{_dynamo_html(s)}</td>
-          <td class="r" data-v="{vol_dv}">{_vol_pct_html(s['buy'], mkt)}</td>
+          <td class="r" data-v="{vol_dv}">{vol_html}</td>
         </tr>"""
         if has_det:
             panel = render_detail_panel(details[rec_key], br["名稱"], tk, s["name"])
@@ -938,7 +1002,8 @@ def render_branch_section(br: dict, twse_vol: dict,
     </div>"""
 
 def render_html(all_branches: list[dict], consensus: list[dict],
-                twse_vol: dict, details: dict | None = None) -> str:
+                twse_vol: dict, details: dict | None = None,
+                twse_monthly: dict | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
@@ -962,7 +1027,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     for b in all_branches:
         tid = f"br-{b['名稱']}"
         tab_nav += f'<button class="tab-btn" data-tab="{tid}" onclick="showTab(\'{tid}\')">{b["名稱"]}</button>'
-        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, details)}</div>'
+        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, details, twse_monthly)}</div>'
 
     vol_note = f"（TWSE 成交量已載入 {len(twse_vol)} 檔，佔市場量 % 供參考，上櫃個股可能無資料）" if twse_vol else "（TWSE 成交量載入失敗，佔市場量 % 不顯示）"
 
@@ -1069,15 +1134,18 @@ def main():
     print(f"  有效歷史快照（排除今日）：{len(history)} 日")
 
     # 計算籌碼動能（連買天數 + 積累信號）
-    apply_accumulation(all_branches, history)
+    apply_accumulation(all_branches, history, data_date)
 
     # 儲存今日快照（供明日連買計算用）
     if data_date:
         save_daily_snapshot(all_branches, data_date)
 
-    # 抓取 TWSE 成交量
+    # 抓取 TWSE 成交量（今日 + 整月歷史，供期間佔市場量計算）
     all_tickers = list({s["ticker"] for b in all_branches for s in b["stocks"]})
-    twse_vol = fetch_twse_volumes(all_tickers, data_date) if data_date else {}
+    if data_date:
+        twse_vol, twse_monthly = fetch_twse_volumes(all_tickers, data_date)
+    else:
+        twse_vol, twse_monthly = {}, {}
 
     # 共識分析
     consensus = build_consensus(all_branches)
@@ -1109,7 +1177,7 @@ def main():
     details = fetch_all_details(all_branches)
 
     # 產生 HTML
-    html = render_html(all_branches, consensus, twse_vol, details)
+    html = render_html(all_branches, consensus, twse_vol, details, twse_monthly)
     if save_file:
         out = SCRIPT_DIR / "index.html"
         out.write_text(html, "utf-8")
