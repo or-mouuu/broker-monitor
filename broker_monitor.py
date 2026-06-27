@@ -331,8 +331,8 @@ def _roc_to_ymd(roc: str) -> str:
     p = roc.split("/")
     return f"{int(p[0])+1911}{p[1]}{p[2]}"
 
-def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict[str, int]]:
-    """回傳 (ticker, 當日千元, {yyyymmdd: 千元} 整月)"""
+def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict, dict]:
+    """回傳 (ticker, 當日千元, {yyyymmdd:千元}, {yyyymmdd:{o,h,l,c}} 整月)"""
     url = TWSE_API.format(date=date_str, ticker=ticker)
     try:
         out = subprocess.run(
@@ -342,36 +342,47 @@ def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict[str, i
         data  = json.loads(out)
         rows  = data.get('data', [])
         monthly: dict[str, int] = {}
+        monthly_ohlc: dict[str, dict] = {}
         for row in rows:
             try:
                 ad = _roc_to_ymd(row[0])
                 monthly[ad] = int(row[2].replace(',', '')) // 1000
+                if row[3] not in ('--', ' '):
+                    monthly_ohlc[ad] = {
+                        "o": float(row[3].replace(',', '')),
+                        "h": float(row[4].replace(',', '')),
+                        "l": float(row[5].replace(',', '')),
+                        "c": float(row[6].replace(',', '')),
+                    }
             except Exception:
                 pass
         today_val = monthly.get(date_str, (int(rows[-1][2].replace(',', '')) // 1000 if rows else 0))
-        return ticker, today_val, monthly
+        return ticker, today_val, monthly, monthly_ohlc
     except Exception:
         pass
-    return ticker, 0, {}
+    return ticker, 0, {}, {}
 
 def fetch_twse_volumes(
     tickers: list[str], date_str: str
-) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
-    """並發抓取各股票 TWSE 成交金額。
-    回傳 (twse_vol={ticker:今日千元}, twse_monthly={ticker:{yyyymmdd:千元}})"""
-    print(f"  載入 TWSE 成交量（{len(tickers)} 檔，並發 10）…", end=" ", flush=True)
+) -> tuple[dict, dict, dict]:
+    """並發抓取各股票 TWSE 成交金額與 OHLC。
+    回傳 (twse_vol, twse_monthly, twse_ohlc)"""
+    print(f"  載入 TWSE 成交量/股價（{len(tickers)} 檔，並發 10）…", end=" ", flush=True)
     twse_vol: dict[str, int] = {}
     twse_monthly: dict[str, dict[str, int]] = {}
+    twse_ohlc: dict[str, dict[str, dict]] = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(_fetch_one_volume, t, date_str): t for t in tickers}
         for f in as_completed(futures):
-            tk, val, monthly = f.result()
+            tk, val, monthly, ohlc = f.result()
             if val > 0:
                 twse_vol[tk] = val
             if monthly:
                 twse_monthly[tk] = monthly
+            if ohlc:
+                twse_ohlc[tk] = ohlc
     print(f"成功 {len(twse_vol)}/{len(tickers)} 檔")
-    return twse_vol, twse_monthly
+    return twse_vol, twse_monthly, twse_ohlc
 
 # ════════════════════════════════════════════════════════════
 # 歷史資料（連買天數）
@@ -503,6 +514,44 @@ def make_sparkline(daily: list[float], w: int = 64, h: int = 20) -> str:
     return (f'<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" '
             f'style="vertical-align:middle;margin-left:3px;flex-shrink:0" '
             f'xmlns="http://www.w3.org/2000/svg">{base}{line}{dots}</svg>')
+
+def make_candle_svg(ohlc_list: list[dict], w: int = 72, h: int = 28) -> str:
+    """生成 5 日迷你 K 線圖 SVG（ohlc_list: 最舊→最新）"""
+    n = len(ohlc_list)
+    if n < 1:
+        return ""
+    p_min = min(x["l"] for x in ohlc_list)
+    p_max = max(x["h"] for x in ohlc_list)
+    p_rng = (p_max - p_min) or (p_min * 0.01) or 1
+    pad = 2
+
+    def py(price: float) -> float:
+        return pad + (p_max - price) / p_rng * (h - pad * 2)
+
+    body_w = max(4, w // n - 3)
+    gap    = max(1, (w - n * body_w) / (n + 1))
+    parts: list[str] = []
+    for i, d in enumerate(ohlc_list):
+        xc = gap + i * (body_w + gap) + body_w / 2
+        xl = gap + i * (body_w + gap)
+        y_hi  = py(d["h"]); y_lo = py(d["l"])
+        y_o   = py(d["o"]); y_c  = py(d["c"])
+        y_top = min(y_o, y_c); bh = max(1.0, abs(y_o - y_c))
+        col   = "#16a34a" if d["c"] >= d["o"] else "#ef4444"
+        parts.append(f'<line x1="{xc:.1f}" y1="{y_hi:.1f}" x2="{xc:.1f}" y2="{y_lo:.1f}" '
+                     f'stroke="{col}" stroke-width="1"/>')
+        parts.append(f'<rect x="{xl:.1f}" y="{y_top:.1f}" width="{body_w}" '
+                     f'height="{bh:.1f}" fill="{col}"/>')
+    return (f'<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" '
+            f'style="vertical-align:middle;flex-shrink:0" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(parts)}</svg>')
+
+
+def _get_recent_ohlc(ticker: str, upto_date: str, twse_ohlc: dict, n: int = 5) -> list[dict]:
+    """取最近 n 個交易日 OHLC（最舊→最新），上限為 upto_date"""
+    ohlc_map = twse_ohlc.get(ticker, {})
+    dates = sorted(d for d in ohlc_map if d <= upto_date)[-n:]
+    return [ohlc_map[d] for d in dates]
 
 # ════════════════════════════════════════════════════════════
 # 整合資料
@@ -711,6 +760,10 @@ tr:hover td{background:#f8faff}
 .vol-md{color:#1d4ed8;font-size:.76rem;font-weight:500}
 .vol-hi{color:#b45309;font-size:.76rem;font-weight:700}
 .vol-xh{color:#b91c1c;font-size:.76rem;font-weight:700}
+/* ── Price cell (收盤+K線) ── */
+.price-cell{display:flex;align-items:center;gap:5px;justify-content:flex-end}
+.price-val{font-size:.8rem;font-weight:600;white-space:nowrap;min-width:46px;text-align:right}
+.price-up{color:#16a34a}.price-dn{color:#ef4444}.price-flat{color:#94a3b8}
 /* ── Buy sub (5日/10日) ── */
 .buy-sub{font-size:.64rem;color:#94a3b8;margin-top:.07rem;white-space:nowrap;line-height:1.3}
 /* ── Misc ── */
@@ -926,7 +979,8 @@ def _period_vol_pct_html(buy_gross: int, dates: list[str], ticker: str,
 
 def render_branch_section(br: dict, twse_vol: dict,
                           twse_monthly: dict | None = None,
-                          fini_data: dict | None = None) -> str:
+                          twse_ohlc: dict | None = None,
+                          data_date: str = "") -> str:
     stocks = [s for s in br["stocks"] if s["net"] >= MIN_NET_DISPLAY]
     if not stocks:
         return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無資料</span></div></div>'
@@ -942,6 +996,21 @@ def render_branch_section(br: dict, twse_vol: dict,
 
         fiveday = s.get("fiveday_net", 0)
         d10     = s.get("d10_net", 0)
+
+        # 收盤價 + 5日K線
+        _upto = data_date or br.get("data_date", "")
+        _ohlc5 = _get_recent_ohlc(tk, _upto, twse_ohlc) if twse_ohlc else []
+        if _ohlc5:
+            close  = _ohlc5[-1]["c"]
+            prev_c = _ohlc5[-2]["c"] if len(_ohlc5) >= 2 else close
+            pcls   = "price-up" if close > prev_c else "price-dn" if close < prev_c else "price-flat"
+            price_dv   = f"{close:.2f}"
+            price_html = (f'<div class="price-cell">'
+                          f'<span class="price-val {pcls}">{close:,.1f}</span>'
+                          f'{make_candle_svg(_ohlc5)}</div>')
+        else:
+            price_dv   = "0"
+            price_html = '<span class="price-flat">–</span>'
 
         # 佔市場量：連買或積累中用期間合計
         if twse_monthly and (is_accum or streak >= 2):
@@ -968,7 +1037,7 @@ def render_branch_section(br: dict, twse_vol: dict,
           <td class="r col-hide" data-v="{d10}">{fmt_n(d10) if d10 else '–'}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
           <td data-v="{streak}">{_dynamo_html(s)}</td>
-          <td class="col-hide" data-v="{fini_data.get(tk, {}).get('fini_net', 0) if fini_data else 0}">{_fini_html(fini_data.get(tk) if fini_data else None)}</td>
+          <td data-v="{price_dv}" style="text-align:right">{price_html}</td>
           <td class="r col-hide" data-v="{vol_dv}">{vol_html}</td>
         </tr>"""
 
@@ -990,7 +1059,7 @@ def render_branch_section(br: dict, twse_vol: dict,
           <th class="r col-hide" data-num="1" onclick="sortTable(this)">近10日(千) ↕</th>
           <th class="r" data-num="1" onclick="sortTable(this)">今/均倍率 ↕</th>
           <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
-          <th class="col-hide" data-num="1" onclick="sortTable(this)">外資/投信 ↕</th>
+          <th data-num="1" onclick="sortTable(this)">收盤/K線 ↕</th>
           <th class="r col-hide" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
         </tr></thead>
         <tbody>{rows}</tbody>
@@ -1062,7 +1131,7 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
 
 def render_html(all_branches: list[dict], consensus: list[dict],
                 twse_vol: dict, twse_monthly: dict | None = None,
-                fini_data: dict | None = None) -> str:
+                twse_ohlc: dict | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
@@ -1094,7 +1163,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     for b in all_branches:
         tid = f"br-{b['名稱']}"
         tab_nav += f'<button class="tab-btn" data-tab="{tid}" onclick="showTab(\'{tid}\')">{b["名稱"]}</button>'
-        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, twse_monthly, fini_data)}</div>'
+        panels  += f'<div id="{tid}" class="tab-panel">{render_branch_section(b, twse_vol, twse_monthly, twse_ohlc, data_date)}</div>'
 
     vol_note = f"（TWSE 成交量已載入 {len(twse_vol)} 檔，佔市場量 % 供參考，上櫃個股可能無資料）" if twse_vol else "（TWSE 成交量載入失敗，佔市場量 % 不顯示）"
 
@@ -1218,14 +1287,13 @@ def main():
     if data_date:
         save_daily_snapshot(all_branches, data_date)
 
-    # 抓取 TWSE 成交量（今日 + 整月歷史，供期間佔市場量計算）
+    # 抓取 TWSE 成交量、OHLC（今日 + 整月歷史，供期間佔市場量計算及K線）
     all_tickers = list({s["ticker"] for b in all_branches for s in b["stocks"]})
     if data_date:
-        twse_vol, twse_monthly = fetch_twse_volumes(all_tickers, data_date)
-        fini_data = fetch_fini(data_date)
+        twse_vol, twse_monthly, twse_ohlc = fetch_twse_volumes(all_tickers, data_date)
         apply_strong_accum(all_branches, twse_monthly)
     else:
-        twse_vol, twse_monthly, fini_data = {}, {}, {}
+        twse_vol, twse_monthly, twse_ohlc = {}, {}, {}
 
     # 共識分析
     consensus = build_consensus(all_branches)
@@ -1254,7 +1322,7 @@ def main():
             print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
 
     # 產生 HTML
-    html = render_html(all_branches, consensus, twse_vol, twse_monthly, fini_data)
+    html = render_html(all_branches, consensus, twse_vol, twse_monthly, twse_ohlc)
     if save_file:
         out = SCRIPT_DIR / "index.html"
         out.write_text(html, "utf-8")
