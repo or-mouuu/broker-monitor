@@ -488,6 +488,7 @@ def fetch_branch(branch: dict) -> dict:
             "streak": 0, "streak_total": 0, "streak_daily": [],
             "buy_days": 0, "window_days": 0, "window_buy_tot": 0,
             "is_accumulating": False, "all_daily": [], "d10_net": 0,
+            "is_strong_accum": False,
         })
 
     print(f"今日 {len(today_stocks)} 筆，五日 {len(fiveday_stocks)} 筆")
@@ -502,6 +503,25 @@ def apply_accumulation(all_branches: list[dict], history: list[dict], data_date:
                 history, br["名稱"], s["ticker"],
                 s["net"], s.get("buy", 0), data_date
             ))
+
+STRONG_ACCUM_MIN_DAYS  = 5      # 至少 5 天有買
+STRONG_ACCUM_MIN_VOL_PCT = 0.5  # 期間佔市場量 ≥ 0.5%
+
+def apply_strong_accum(all_branches: list[dict], twse_monthly: dict):
+    """在 TWSE 月量載入後，標記強積累（積累 + buy_days≥5 + 期間佔市場量≥0.5%）"""
+    for br in all_branches:
+        for s in br["stocks"]:
+            s["is_strong_accum"] = False
+            if not s.get("is_accumulating"):
+                continue
+            if s.get("buy_days", 0) < STRONG_ACCUM_MIN_DAYS:
+                continue
+            tk      = s["ticker"]
+            _dates  = s.get("window_dates", [])
+            _buy_g  = s.get("window_buy_gross", 0)
+            mkt_sum = sum(twse_monthly.get(tk, {}).get(d, 0) for d in _dates)
+            if mkt_sum > 0 and _buy_g / mkt_sum * 100 >= STRONG_ACCUM_MIN_VOL_PCT:
+                s["is_strong_accum"] = True
 
 def build_consensus(all_branches: list[dict]) -> list[dict]:
     agg = defaultdict(lambda: {
@@ -969,13 +989,14 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
     # ── 積累中（依密度排序：buy_days/window_days 高→低，再按 window_buy_tot）──
     ac_entries = sorted(
         [(b["名稱"], s["ticker"], s["name"],
-          s.get("buy_days", 0), s.get("window_days", 1), s.get("window_buy_tot", 0))
+          s.get("buy_days", 0), s.get("window_days", 1), s.get("window_buy_tot", 0),
+          s.get("is_strong_accum", False))
          for b in all_branches for s in b["stocks"] if s.get("is_accumulating")],
         key=lambda x: (-x[3] / x[4], -x[5])
     )
     ac_items = ""
-    for br, tk, nm, bd, wd, tot in ac_entries:
-        tier = '<span class="pill pill-amber">強積累</span> ' if bd >= 5 else ''
+    for br, tk, nm, bd, wd, tot, strong in ac_entries:
+        tier = '<span class="pill pill-amber">強積累</span> ' if strong else ''
         ac_items += (
             f'<div class="modal-item">'
             f'<span class="tk-code">{tk}</span>'
@@ -1003,7 +1024,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     spike_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_spike")]
     streak_5p   = [s for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5]
     accum_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_accumulating")]
-    accum_strong = sum(1 for s in accum_list if s.get("buy_days", 0) >= 5)
+    accum_strong = sum(1 for s in accum_list if s.get("is_strong_accum"))
     total_buy_m = sum(s["buy"] for b in all_branches for s in b["stocks"]) // 1_000
 
     modal_divs = _build_modal_divs(all_branches)
@@ -1154,6 +1175,7 @@ def main():
     if data_date:
         twse_vol, twse_monthly = fetch_twse_volumes(all_tickers, data_date)
         fini_data = fetch_fini(data_date)
+        apply_strong_accum(all_branches, twse_monthly)
     else:
         twse_vol, twse_monthly, fini_data = {}, {}, {}
 
