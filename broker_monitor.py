@@ -965,9 +965,9 @@ def render_consensus_table(consensus, total_branches, twse_vol):
         <th onclick="sortTable(this)">代號 / 名稱 ↕</th>
         <th class="r" data-num="1" onclick="sortTable(this)">分點 ↕</th>
         <th class="r" data-num="1" onclick="sortTable(this)">合計買超 ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this)" class="col-hide">跨點倍率 ↕</th>
+        <th class="r col-hide" data-num="1" onclick="sortTable(this)">跨點倍率 ↕</th>
         <th data-num="1" onclick="sortTable(this)">籌碼動能 ↕</th>
-        <th class="r" data-num="1" onclick="sortTable(this) col-hide">佔市場量 ↕</th>
+        <th class="r col-hide" data-num="1" onclick="sortTable(this)">佔市場量 ↕</th>
         <th class="col-hide">買進分點</th>
       </tr></thead>
       <tbody>{rows}</tbody>
