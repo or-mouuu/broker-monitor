@@ -1076,10 +1076,14 @@ def render_branch_section(br: dict, twse_vol: dict,
 def _build_modal_divs(all_branches: list[dict]) -> str:
     """預建各 signal modal 內容（隱藏 div），由 openSignal() 複製到 modal-body"""
 
+    def _vis(s):
+        """只取今日在 tab 中可見（net ≥ MIN_NET_DISPLAY）的股票"""
+        return s["net"] >= MIN_NET_DISPLAY
+
     # ── 爆量個股 ──
     spk_entries = sorted(
         [(b["名稱"], s["ticker"], s["name"], s.get("spike") or 0, s["net"])
-         for b in all_branches for s in b["stocks"] if s.get("is_spike")],
+         for b in all_branches for s in b["stocks"] if s.get("is_spike") and _vis(s)],
         key=lambda x: (-x[3], -x[4])
     )
     spk_items = "".join(
@@ -1095,7 +1099,7 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
     # ── 連買≥5日 ──
     s5_entries = sorted(
         [(b["名稱"], s["ticker"], s["name"], s.get("streak", 0), s.get("streak_total", 0))
-         for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5],
+         for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5 and _vis(s)],
         key=lambda x: (-x[3], -x[4])
     )
     s5_items = "".join(
@@ -1113,7 +1117,7 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
         [(b["名稱"], s["ticker"], s["name"],
           s.get("buy_days", 0), s.get("window_days", 1), s.get("window_buy_tot", 0),
           s.get("is_strong_accum", False))
-         for b in all_branches for s in b["stocks"] if s.get("is_accumulating")],
+         for b in all_branches for s in b["stocks"] if s.get("is_accumulating") and _vis(s)],
         key=lambda x: (-x[3] / x[4], -x[5])
     )
     ac_items = ""
