@@ -983,7 +983,8 @@ def render_branch_section(br: dict, twse_vol: dict,
                           twse_monthly: dict | None = None,
                           twse_ohlc: dict | None = None,
                           data_date: str = "") -> str:
-    stocks = [s for s in br["stocks"] if s["net"] >= MIN_NET_DISPLAY]
+    stocks = [s for s in br["stocks"]
+              if s["net"] >= MIN_NET_DISPLAY or s.get("streak", 0) >= 5]
     if not stocks:
         return f'<div class="branch-section"><div class="branch-title">{br["名稱"]} <span class="br-chip">無資料</span></div></div>'
 
@@ -994,7 +995,8 @@ def render_branch_section(br: dict, twse_vol: dict,
         streak   = s.get("streak", 0)
         is_accum = s.get("is_accumulating", False)
         spike_dv = f"{s['spike']:.2f}" if s.get("spike") else "0"
-        pure_tag = ' <span class="pill pill-green">純買</span>' if s["sell"] == 0 else ""
+        pure_tag  = ' <span class="pill pill-green">純買</span>' if s["sell"] == 0 else ""
+        low_tag   = ' <span class="pill pill-gray">今日低量</span>' if s["net"] < MIN_NET_DISPLAY else ""
 
         fiveday = s.get("fiveday_net", 0)
         d10     = s.get("d10_net", 0)
@@ -1039,7 +1041,7 @@ def render_branch_section(br: dict, twse_vol: dict,
         rows += f"""<tr>
           <td class="r" style="color:#bbb;font-size:.72rem;width:28px">{i}</td>
           <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{s['name']}</span></div></td>
-          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}</td>
+          <td class="r net-pos" data-v="{s['net']}">{fmt_n(s['net'])}{pure_tag}{low_tag}</td>
           <td class="r" data-v="{fiveday}">{fmt_n(fiveday) if fiveday else '–'}</td>
           <td class="r col-hide" data-v="{d10}">{fmt_n(d10) if d10 else '–'}</td>
           <td class="r" data-v="{spike_dv}">{_spike_html(s.get('spike'))}</td>
@@ -1096,10 +1098,10 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
         for br, tk, nm, sp, net in spk_entries
     )
 
-    # ── 連買≥5日 ──
+    # ── 連買≥5日（不限門檻，低量者另加標示）──
     s5_entries = sorted(
-        [(b["名稱"], s["ticker"], s["name"], s.get("streak", 0), s.get("streak_total", 0))
-         for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5 and _vis(s)],
+        [(b["名稱"], s["ticker"], s["name"], s.get("streak", 0), s.get("streak_total", 0), _vis(s))
+         for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5],
         key=lambda x: (-x[3], -x[4])
     )
     s5_items = "".join(
@@ -1107,9 +1109,10 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
         f'<span class="tk-code">{tk}</span>'
         f'<span class="tk-name">{nm}</span>'
         f'<span class="br-chip">{br}</span>'
+        f'{"" if vis else "<span class=\"pill pill-gray\">今日低量</span>"}'
         f'<div class="modal-right">{_streak_html(d)}<br><span class="modal-sub">累計 +{fmt_n(tot)}千</span></div>'
         f'</div>'
-        for br, tk, nm, d, tot in s5_entries
+        for br, tk, nm, d, tot, vis in s5_entries
     )
 
     # ── 積累中（依密度排序：buy_days/window_days 高→低，再按 window_buy_tot）──
