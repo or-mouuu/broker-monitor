@@ -16,13 +16,13 @@ jobs:
     steps:
       # ── 1. 取得程式碼（帶歷史資料）──────────────────────────
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # ── 2. 設定 Python ─────────────────────────────────────
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: "3.11"
 
