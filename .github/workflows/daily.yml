@@ -8,10 +8,19 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
 
 jobs:
   fetch-and-publish:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
 
     steps:
       # ── 1. 取得程式碼（帶歷史資料）──────────────────────────
@@ -54,12 +63,14 @@ jobs:
           git diff --staged --quiet || git commit -m "自動更新：$(date -u +'%Y/%m/%d %H:%M UTC')"
           git push
 
-      # ── 6. 部署 index.html 到 GitHub Pages ──────────────────
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+      # ── 6. 上傳 index.html 至 GitHub Pages ──────────────────
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./
-          publish_branch: gh-pages
-          include_files: index.html
-          commit_message: "自動更新：$(date -u +'%Y/%m/%d %H:%M UTC')"
+          path: ./
+          include_hidden_files: false
+
+      # ── 7. 部署至 GitHub Pages ───────────────────────────────
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
