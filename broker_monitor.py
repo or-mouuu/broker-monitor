@@ -1104,12 +1104,13 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
          for b in all_branches for s in b["stocks"] if s.get("streak", 0) >= 5],
         key=lambda x: (-x[3], -x[4])
     )
+    _low_pill = '<span class="pill pill-gray">今日低量</span>'
     s5_items = "".join(
         f'<div class="modal-item">'
         f'<span class="tk-code">{tk}</span>'
         f'<span class="tk-name">{nm}</span>'
         f'<span class="br-chip">{br}</span>'
-        f'{"" if vis else "<span class=\"pill pill-gray\">今日低量</span>"}'
+        f'{"" if vis else _low_pill}'
         f'<div class="modal-right">{_streak_html(d)}<br><span class="modal-sub">累計 +{fmt_n(tot)}千</span></div>'
         f'</div>'
         for br, tk, nm, d, tot, vis in s5_entries
