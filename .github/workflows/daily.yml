@@ -2,8 +2,8 @@ name: 每日券商分點大額買進監控
 
 on:
   schedule:
-    # 台灣時間 19:30（資料更新後），UTC 11:30，週一至週五
-    - cron: "30 11 * * 1-5"
+    # 台灣時間約 19:30（UTC 09:30，提前2小時預留 GitHub delay），週一至週五
+    - cron: "30 9 * * 1-5"
   workflow_dispatch:   # 允許手動觸發
 
 permissions:
