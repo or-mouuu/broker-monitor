@@ -533,12 +533,12 @@ def make_sparkline(daily: list[float], w: int = 64, h: int = 20) -> str:
     ys = [round(mid - (v / max_abs) * (mid - 2), 1) for v in daily]
 
     pts   = " ".join(f"{x},{y}" for x, y in zip(xs, ys))
-    color = "#16a34a" if daily[-1] > 0 else "#ef4444"
+    color = "#ef4444" if daily[-1] > 0 else "#16a34a"
     base  = f'<line x1="0" y1="{mid}" x2="{w}" y2="{mid}" stroke="#e2e8f0" stroke-width="0.8"/>'
     line  = (f'<polyline points="{pts}" fill="none" stroke="{color}" '
              f'stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>')
     dots  = "".join(
-        f'<circle cx="{x}" cy="{y}" r="2" fill="{"#16a34a" if v>0 else "#ef4444" if v<0 else "#94a3b8"}"/>'
+        f'<circle cx="{x}" cy="{y}" r="2" fill="{"#ef4444" if v>0 else "#16a34a" if v<0 else "#94a3b8"}"/>'
         for x, y, v in zip(xs, ys, daily)
     )
     return (f'<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" '
