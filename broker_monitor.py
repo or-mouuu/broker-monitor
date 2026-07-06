@@ -332,40 +332,48 @@ def _roc_to_ymd(roc: str) -> str:
     p = roc.split("/")
     return f"{int(p[0])+1911}{p[1]}{p[2]}"
 
-def _fetch_twse_month(ticker: str, date_str: str) -> tuple[dict, dict, int]:
+def _fetch_twse_month(ticker: str, date_str: str, retries: int = 3) -> tuple[dict, dict, int]:
     """抓取單一 ticker 單月資料。回傳 (monthly, monthly_ohlc, last_val)
-    last_val = 該月最後一筆成交金額（千元），供無精確日期比對時的 fallback。"""
+    last_val = 該月最後一筆成交金額（千元），供無精確日期比對時的 fallback。
+    TWSE API 併發時偶有暫時性失敗（回傳非 OK 的 stat 或空資料），故加入重試。"""
     url = TWSE_API.format(date=date_str, ticker=ticker)
     monthly: dict[str, int] = {}
     monthly_ohlc: dict[str, dict] = {}
     last_val = 0
-    try:
-        out = subprocess.run(
-            ['curl', '-s', '--max-time', '10', '-H', 'User-Agent: Mozilla/5.0', url],
-            capture_output=True, text=True, timeout=15
-        ).stdout
-        data = json.loads(out)
-        rows = data.get('data', [])
-        for row in rows:
-            try:
-                ad = _roc_to_ymd(row[0])
-                monthly[ad] = int(row[2].replace(',', '')) // 1000
-                if row[3] not in ('--', ' '):
-                    monthly_ohlc[ad] = {
-                        "o": float(row[3].replace(',', '')),
-                        "h": float(row[4].replace(',', '')),
-                        "l": float(row[5].replace(',', '')),
-                        "c": float(row[6].replace(',', '')),
-                    }
-            except Exception:
-                pass
-        if rows:
-            try:
-                last_val = int(rows[-1][2].replace(',', '')) // 1000
-            except Exception:
-                pass
-    except Exception:
-        pass
+
+    for attempt in range(retries):
+        try:
+            out = subprocess.run(
+                ['curl', '-s', '--max-time', '10', '-H', 'User-Agent: Mozilla/5.0', url],
+                capture_output=True, text=True, timeout=15
+            ).stdout
+            data = json.loads(out)
+            if data.get('stat') != 'OK':
+                raise ValueError(f"TWSE stat 非 OK：{data.get('stat')}")
+            rows = data.get('data', [])
+            for row in rows:
+                try:
+                    ad = _roc_to_ymd(row[0])
+                    monthly[ad] = int(row[2].replace(',', '')) // 1000
+                    if row[3] not in ('--', ' '):
+                        monthly_ohlc[ad] = {
+                            "o": float(row[3].replace(',', '')),
+                            "h": float(row[4].replace(',', '')),
+                            "l": float(row[5].replace(',', '')),
+                            "c": float(row[6].replace(',', '')),
+                        }
+                except Exception:
+                    pass
+            if rows:
+                try:
+                    last_val = int(rows[-1][2].replace(',', '')) // 1000
+                except Exception:
+                    pass
+            break  # 成功即跳出重試迴圈
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(0.4 * (attempt + 1))
+            continue
     return monthly, monthly_ohlc, last_val
 
 
