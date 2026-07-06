@@ -1510,7 +1510,6 @@ def render_html(all_branches: list[dict], consensus: list[dict],
 
     stats = f"""<div class="stats">
       <div class="stat"><div class="lbl">資料日期</div><div class="val" style="font-size:1rem">{date_disp}</div></div>
-      <div class="stat"><div class="lbl">監控分點</div><div class="val">{total_br}</div></div>
       <div class="stat clickable" onclick="showTab('consensus')" title="切換至共識買進分頁">
         <div class="lbl">共識買進</div><div class="val">{len(consensus)}</div><div class="sub">≥2分點同買</div></div>
       <div class="stat clickable" onclick="showTab('hoarding')" title="切換至囤貨追蹤分頁">
