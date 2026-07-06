@@ -848,6 +848,51 @@ def compute_hoarding(all_branches: list[dict], history: list[dict],
     return results
 
 
+HOARD_SCORE_FILE   = DATA_DIR / "hoard_scores.json"
+HOARD_HISTORY_DAYS = 5   # 囤貨分數快照滾動保留天數（供「新進榜」比對用）
+
+def load_hoard_scores() -> dict:
+    """讀取囤貨分數歷史快照 {yyyymmdd: [{branch,ticker,score}, ...]}"""
+    if not HOARD_SCORE_FILE.exists():
+        return {}
+    try:
+        return json.loads(HOARD_SCORE_FILE.read_text("utf-8"))
+    except Exception:
+        return {}
+
+
+def save_hoard_scores(prev_scores: dict, hoarding: list[dict], data_date: str):
+    """將今日囤貨分數併入歷史快照，只保留最近 HOARD_HISTORY_DAYS 個交易日。"""
+    if not data_date:
+        return
+    prev_scores[data_date] = [
+        {"branch": r["branch"], "ticker": r["ticker"], "score": r["score"]}
+        for r in hoarding
+    ]
+    keys = sorted(prev_scores.keys(), reverse=True)[:HOARD_HISTORY_DAYS]
+    trimmed = {k: prev_scores[k] for k in keys}
+    DATA_DIR.mkdir(exist_ok=True)
+    HOARD_SCORE_FILE.write_text(
+        json.dumps(trimmed, ensure_ascii=False, separators=(',', ':')), "utf-8"
+    )
+
+
+def mark_new_hoarding(hoarding: list[dict], prev_scores: dict, data_date: str) -> None:
+    """就地標記每筆囤貨配對的 is_new：昨日（prev_scores 中早於今日的最近一個交易日，
+    自然跳過假日/非交易日）不存在該配對，或未達 HOARD_SCORE_MIN 門檻 → 視為新進榜。
+    prev_scores 應為「寫入今日資料前」讀取的歷史快照；若檔案不存在（首次執行）全部標為非新進榜。"""
+    prior_dates = sorted((d for d in prev_scores if d < data_date), reverse=True)
+    if not prior_dates:
+        for r in hoarding:
+            r["is_new"] = False
+        return
+    yesterday = prior_dates[0]
+    prev_map = {(x["branch"], x["ticker"]): x["score"] for x in prev_scores.get(yesterday, [])}
+    for r in hoarding:
+        prev_score = prev_map.get((r["branch"], r["ticker"]))
+        r["is_new"] = prev_score is None or prev_score < HOARD_SCORE_MIN
+
+
 def build_consensus(all_branches: list[dict]) -> list[dict]:
     agg = defaultdict(lambda: {
         "name": "", "branches": [], "total_buy": 0, "total_net": 0,
@@ -1516,9 +1561,11 @@ def render_html(all_branches: list[dict], consensus: list[dict],
 # ════════════════════════════════════════════════════════════
 
 def render_email_digest(all_branches: list[dict], consensus: list[dict],
-                        twse_ohlc: dict, data_date: str) -> str:
+                        twse_ohlc: dict, data_date: str,
+                        hoarding: list[dict] | None = None) -> str:
     """生成簡潔日報 HTML（email 專用，inline style）"""
     date_disp = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date) == 8 else data_date
+    hoarding = hoarding or []
 
     # ── 各信號清單 ──
     strong_tickers = {s["ticker"] for b in all_branches for s in b["stocks"]
@@ -1566,6 +1613,7 @@ def render_email_digest(all_branches: list[dict], consensus: list[dict],
     n_strong   = len(strong_map)
     n_spike    = len(spike_map)
     n_cons     = len(consensus)
+    n_hoard    = len(hoarding)
 
     # ── Style helpers ──
     TH  = 'style="background:#f8fafc;padding:6px 10px;font-size:.72rem;color:#64748b;text-align:left;border-bottom:2px solid #e2e8f0;white-space:nowrap"'
@@ -1621,6 +1669,35 @@ def render_email_digest(all_branches: list[dict], consensus: list[dict],
           <th {TH}>代號 / 名稱</th><th {THR}>分點數</th>
           <th {THR}>合計買超</th><th {THR}>收盤價</th>
         </tr></thead><tbody>{rows_c}</tbody></table>""" if rows_c else ""
+
+    # ── 囤貨警示（is_new 優先，再按分數降冪）──
+    hoard_sorted = sorted(hoarding, key=lambda x: (not x.get("is_new", False), -x["score"]))
+    rows_h = ""
+    for r in hoard_sorted[:10]:
+        tk    = r["ticker"]
+        extra = ""
+        if r.get("is_new"):
+            extra += pill_s("NEW", "#dc2626", "#ffffff")
+        if r.get("co_hoard_count", 0) >= 2:
+            extra += pill_s(f'{r["co_hoard_count"]}點共囤', "#dbeafe", "#1d4ed8")
+        dev      = r.get("cost_dev_pct", 0)
+        dev_col  = "#dc2626" if dev > 0 else "#16a34a" if dev < 0 else "#64748b"
+        cost_html = f'<span style="color:{dev_col};font-weight:600">{dev:+.1f}%</span>' if r.get("est_cost") else "–"
+        score_bg = "#fef2f2" if r["score"] >= 80 else "#fff7ed"
+        score_fg = "#991b1b" if r["score"] >= 80 else "#c2410c"
+        score_pill = pill_s(f'{r["score"]:.0f}', score_bg, score_fg)
+        rows_h += (
+            f'<tr><td {TD}><b>{tk}</b> <span style="color:#64748b">{r["name"]}</span>{extra}</td>'
+            f'<td {TDR}><span style="font-size:.7rem;color:#94a3b8">{r["branch"]}</span></td>'
+            f'<td {TDR}>{score_pill}</td>'
+            f'<td {TDR}>{cost_html}</td></tr>'
+        )
+    hoard_html = f"""
+        <p {H3S}>🎯 囤貨警示</p>
+        <table {TBL}><thead><tr>
+          <th {TH}>代號 / 名稱</th><th {TH}>分點</th>
+          <th {THR}>分數</th><th {THR}>成本乖離</th>
+        </tr></thead><tbody>{rows_h}</tbody></table>""" if rows_h else ""
 
     # ── 連買≥5日 ──
     rows_s = ""
@@ -1695,24 +1772,25 @@ def render_email_digest(all_branches: list[dict], consensus: list[dict],
   </div>
   <div style="background:#f8fafc;padding:8px 20px;border-bottom:1px solid #e2e8f0;display:flex;gap:16px;flex-wrap:wrap">
     <span style="font-size:.78rem">🔗 共識 <b style="color:#1d4ed8">{n_cons}</b></span>
+    <span style="font-size:.78rem">🎯 囤貨 <b style="color:#b91c1c">{n_hoard}</b></span>
     <span style="font-size:.78rem">📈 連買≥5日 <b style="color:#c2410c">{n_streak5}</b></span>
     <span style="font-size:.78rem">🟠 強積累 <b style="color:#92400e">{n_strong}</b></span>
     <span style="font-size:.78rem">🔥 爆量 <b style="color:#dc2626">{n_spike}</b></span>
   </div>
   <div style="padding:12px 20px 20px">
-    {cons_html}{streak_html}{strong_html}{spike_html}
+    {cons_html}{hoard_html}{streak_html}{strong_html}{spike_html}
   </div>
   {footer}
 </div></body></html>"""
 
 
 def send_email(all_branches: list[dict], consensus: list[dict],
-               twse_ohlc: dict, data_date: str):
+               twse_ohlc: dict, data_date: str, hoarding: list[dict] | None = None):
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]):
         print("⚠️  EMAIL_SENDER/PASSWORD/RECIPIENT 未設定，略過寄信。")
         return
     date_disp = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
-    digest = render_email_digest(all_branches, consensus, twse_ohlc, data_date)
+    digest = render_email_digest(all_branches, consensus, twse_ohlc, data_date, hoarding)
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📊 券商分點日報 — {date_disp}"
     msg["From"]    = EMAIL_SENDER
@@ -1793,8 +1871,12 @@ def main():
     else:
         twse_vol, twse_monthly, twse_ohlc = {}, {}, {}
 
-    # 囤貨分數（14日窗口，偵測分點吸籌行為）
+    # 囤貨分數（14日窗口，偵測分點吸籌行為）+ 新進榜偵測
     hoarding = compute_hoarding(all_branches, history, twse_monthly, twse_ohlc, data_date)
+    prev_hoard_scores = load_hoard_scores()          # 寫入今日資料前的歷史快照
+    mark_new_hoarding(hoarding, prev_hoard_scores, data_date)
+    if data_date:
+        save_hoard_scores(prev_hoard_scores, hoarding, data_date)
 
     # 共識分析
     consensus = build_consensus(all_branches)
@@ -1821,11 +1903,13 @@ def main():
         print(f"\n🟠 積累中（{len(accums)} 筆）：")
         for bn, tk, nm, bd, wd, tot in sorted(accums, key=lambda x: -x[5])[:10]:
             print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
-    print(f"\n🎯 囤貨追蹤：{len(hoarding)} 筆")
+    n_new = sum(1 for r in hoarding if r.get("is_new"))
+    print(f"\n🎯 囤貨追蹤：{len(hoarding)} 筆（其中新進榜 {n_new} 筆）")
     for r in hoarding[:5]:
         cost_str = f"{r['est_cost']:.1f}" if r["est_cost"] else "–"
         close_str = f"{r['close']:.1f}" if r["close"] else "–"
-        print(f"   {r['branch']} | {r['ticker']} {r['name']} | 分數{r['score']:.0f} | 成本{cost_str} vs 現價{close_str}")
+        new_tag = " 🆕" if r.get("is_new") else ""
+        print(f"   {r['branch']} | {r['ticker']} {r['name']} | 分數{r['score']:.0f} | 成本{cost_str} vs 現價{close_str}{new_tag}")
 
     # 產生 HTML
     html = render_html(all_branches, consensus, twse_vol, twse_monthly, twse_ohlc, hoarding)
@@ -1834,7 +1918,7 @@ def main():
         out.write_text(html, "utf-8")
         print(f"\n✅ 已儲存：{out}")
     if do_email:
-        send_email(all_branches, consensus, twse_ohlc, data_date)
+        send_email(all_branches, consensus, twse_ohlc, data_date, hoarding)
 
 def date_disp(d: str) -> str:
     return f"{d[:4]}/{d[4:6]}/{d[6:]}" if len(d) == 8 else d
