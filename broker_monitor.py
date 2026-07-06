@@ -37,6 +37,7 @@ MAX_HISTORY     = 20     # 最多回溯交易日數
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "or.mouuu@gmail.com")
 EMAIL_SENDER    = os.getenv("EMAIL_SENDER",    "")
 EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD",  "")
+PAGES_URL       = os.getenv("PAGES_URL", "https://or-mouuu.github.io/broker-monitor/")
 
 DEFAULT_BRANCHES = [
     {"名稱": "元大-崇德",   "a": "9800", "b": "0039003800310053"},
@@ -1225,21 +1226,214 @@ def render_html(all_branches: list[dict], consensus: list[dict],
 # 電子郵件
 # ════════════════════════════════════════════════════════════
 
-def send_email(html: str, data_date: str):
+def render_email_digest(all_branches: list[dict], consensus: list[dict],
+                        twse_ohlc: dict, data_date: str) -> str:
+    """生成簡潔日報 HTML（email 專用，inline style）"""
+    date_disp = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date) == 8 else data_date
+
+    # ── 各信號清單 ──
+    strong_tickers = {s["ticker"] for b in all_branches for s in b["stocks"]
+                      if s.get("is_strong_accum")}
+
+    streak5 = sorted(
+        [(b["名稱"], s) for b in all_branches for s in b["stocks"]
+         if s.get("streak", 0) >= 5 and s["net"] >= MIN_NET_DISPLAY],
+        key=lambda x: (-x[1]["streak"], -x[1].get("streak_total", 0))
+    )
+    # 每 ticker 取最強分點
+    streak5_map: dict = {}
+    for br, s in streak5:
+        tk = s["ticker"]
+        if tk not in streak5_map or s["streak"] > streak5_map[tk][1]["streak"]:
+            streak5_map[tk] = (br, s)
+    streak5_list = sorted(streak5_map.values(), key=lambda x: (-x[1]["streak"], -x[1].get("streak_total", 0)))
+
+    strong_list = sorted(
+        [(b["名稱"], s) for b in all_branches for s in b["stocks"]
+         if s.get("is_strong_accum") and s["net"] >= MIN_NET_DISPLAY],
+        key=lambda x: (-x[1].get("buy_days", 0), -x[1].get("window_buy_tot", 0))
+    )
+    strong_map: dict = {}
+    for br, s in strong_list:
+        tk = s["ticker"]
+        if tk not in strong_map:
+            strong_map[tk] = (br, s)
+    strong_uniq = sorted(strong_map.values(), key=lambda x: (-x[1].get("buy_days", 0), -x[1].get("window_buy_tot", 0)))
+
+    spike_list = sorted(
+        [(b["名稱"], s) for b in all_branches for s in b["stocks"]
+         if s.get("is_spike") and s["net"] >= MIN_NET_DISPLAY],
+        key=lambda x: -(x[1].get("spike") or 0)
+    )
+    spike_map: dict = {}
+    for br, s in spike_list:
+        tk = s["ticker"]
+        if tk not in spike_map or (s.get("spike") or 0) > (spike_map[tk][1].get("spike") or 0):
+            spike_map[tk] = (br, s)
+    spike_uniq = sorted(spike_map.values(), key=lambda x: -(x[1].get("spike") or 0))
+
+    consensus_tickers = {c["ticker"] for c in consensus}
+    n_streak5  = len(streak5_map)
+    n_strong   = len(strong_map)
+    n_spike    = len(spike_map)
+    n_cons     = len(consensus)
+
+    # ── Style helpers ──
+    TH  = 'style="background:#f8fafc;padding:6px 10px;font-size:.72rem;color:#64748b;text-align:left;border-bottom:2px solid #e2e8f0;white-space:nowrap"'
+    THR = 'style="background:#f8fafc;padding:6px 10px;font-size:.72rem;color:#64748b;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap"'
+    TD  = 'style="padding:7px 10px;font-size:.78rem;border-bottom:1px solid #f1f5f9;vertical-align:middle"'
+    TDR = 'style="padding:7px 10px;font-size:.78rem;border-bottom:1px solid #f1f5f9;text-align:right;vertical-align:middle;white-space:nowrap"'
+    TBL = 'style="width:100%;border-collapse:collapse;margin-bottom:4px"'
+    H3S = 'style="font-size:.82rem;font-weight:700;color:#1e293b;margin:20px 0 8px 0;padding:4px 8px;background:#f1f5f9;border-left:3px solid #3b82f6;border-radius:2px"'
+
+    def pill_s(text, bg, fg):
+        return f'<span style="background:{bg};color:{fg};padding:1px 5px;border-radius:8px;font-size:.68rem;font-weight:600;margin-left:3px">{text}</span>'
+
+    def price_html(ticker):
+        ohlc5 = _get_recent_ohlc(ticker, data_date, twse_ohlc, 2)
+        if not ohlc5:
+            return "–"
+        c  = ohlc5[-1]["c"]
+        p  = ohlc5[-2]["c"] if len(ohlc5) >= 2 else c
+        pct = (c - p) / p * 100 if p else 0
+        col = "#dc2626" if pct > 0 else "#16a34a" if pct < 0 else "#64748b"
+        sign = "+" if pct > 0 else ""
+        return f'<span style="color:{col};font-weight:600">{c:,.0f}</span> <span style="color:{col};font-size:.7rem">({sign}{pct:.1f}%)</span>'
+
+    def tag_cons(tk):
+        return pill_s("共識", "#dbeafe", "#1d4ed8") if tk in consensus_tickers else ""
+
+    def tag_strong(tk):
+        return pill_s("強積累", "#fef3c7", "#92400e") if tk in strong_tickers else ""
+
+    def streak_badge(n):
+        bg, fg = ("#fef3c7", "#92400e") if n >= 7 else ("#ffedd5", "#c2410c") if n >= 5 else ("#f1f5f9", "#475569")
+        return pill_s(f"連{n}日", bg, fg)
+
+    # ── 共識買進 ──
+    rows_c = ""
+    for c in consensus[:15]:
+        tk    = c["ticker"]
+        brs   = "、".join(c["branches"][:3]) + ("…" if len(c["branches"]) > 3 else "")
+        extra = ""
+        if c["max_streak"] >= 5: extra += streak_badge(c["max_streak"])
+        if tk in strong_tickers:  extra += tag_strong(tk)
+        if c.get("is_spike"):     extra += pill_s("爆量", "#fee2e2", "#dc2626")
+        rows_c += (
+            f'<tr><td {TD}><b>{tk}</b> <span style="color:#64748b">{c["name"]}</span>{extra}'
+            f'<div style="font-size:.68rem;color:#94a3b8;margin-top:2px">{brs}</div></td>'
+            f'<td {TDR}>{pill_s(str(c["branch_count"])+" 點", "#dbeafe", "#1d4ed8")}</td>'
+            f'<td {TDR}>{fmt_n(c["total_net"])}千</td>'
+            f'<td {TDR}>{price_html(tk)}</td></tr>'
+        )
+    cons_html = f"""
+        <p {H3S}>🔗 共識買進（≥2 分點同買）</p>
+        <table {TBL}><thead><tr>
+          <th {TH}>代號 / 名稱</th><th {THR}>分點數</th>
+          <th {THR}>合計買超</th><th {THR}>收盤價</th>
+        </tr></thead><tbody>{rows_c}</tbody></table>""" if rows_c else ""
+
+    # ── 連買≥5日 ──
+    rows_s = ""
+    for br, s in streak5_list[:12]:
+        tk = s["ticker"]
+        rows_s += (
+            f'<tr><td {TD}><b>{tk}</b> <span style="color:#64748b">{s["name"]}</span>'
+            f'{tag_cons(tk)}{tag_strong(tk)}</td>'
+            f'<td {TDR}><span style="font-size:.7rem;color:#94a3b8">{br}</span></td>'
+            f'<td {TDR}>{streak_badge(s["streak"])}</td>'
+            f'<td {TDR}>{fmt_n(s.get("streak_total",0))}千</td>'
+            f'<td {TDR}>{price_html(tk)}</td></tr>'
+        )
+    streak_html = f"""
+        <p {H3S}>📈 連買≥5日強勢股</p>
+        <table {TBL}><thead><tr>
+          <th {TH}>代號 / 名稱</th><th {TH}>分點</th>
+          <th {THR}>天數</th><th {THR}>累計買超</th><th {THR}>收盤價</th>
+        </tr></thead><tbody>{rows_s}</tbody></table>""" if rows_s else ""
+
+    # ── 強積累 ──
+    rows_a = ""
+    for br, s in strong_uniq[:12]:
+        tk  = s["ticker"]
+        bd  = s.get("buy_days", 0)
+        wd  = s.get("window_days", 1)
+        tot = s.get("window_buy_tot", 0)
+        rows_a += (
+            f'<tr><td {TD}><b>{tk}</b> <span style="color:#64748b">{s["name"]}</span>'
+            f'{tag_cons(tk)}</td>'
+            f'<td {TDR}><span style="font-size:.7rem;color:#94a3b8">{br}</span></td>'
+            f'<td {TDR}>{pill_s(f"{bd}/{wd}日", "#fef3c7", "#92400e")}</td>'
+            f'<td {TDR}>{fmt_n(tot)}千</td>'
+            f'<td {TDR}>{price_html(tk)}</td></tr>'
+        )
+    strong_html = f"""
+        <p {H3S}>🟠 強積累（≥5日 + 佔市場≥0.5%）</p>
+        <table {TBL}><thead><tr>
+          <th {TH}>代號 / 名稱</th><th {TH}>分點</th>
+          <th {THR}>積累天數</th><th {THR}>窗口買超</th><th {THR}>收盤價</th>
+        </tr></thead><tbody>{rows_a}</tbody></table>""" if rows_a else ""
+
+    # ── 爆量 ──
+    rows_sp = ""
+    for br, s in spike_uniq[:8]:
+        tk = s["ticker"]
+        rows_sp += (
+            f'<tr><td {TD}><b>{tk}</b> <span style="color:#64748b">{s["name"]}</span>'
+            f'{tag_cons(tk)}{tag_strong(tk)}</td>'
+            f'<td {TDR}><span style="font-size:.7rem;color:#94a3b8">{br}</span></td>'
+            f'<td {TDR}><span style="color:#dc2626;font-weight:700">{s["spike"]:.1f}x</span></td>'
+            f'<td {TDR}>{fmt_n(s["net"])}千</td>'
+            f'<td {TDR}>{price_html(tk)}</td></tr>'
+        )
+    spike_html = f"""
+        <p {H3S}>🔥 爆量個股</p>
+        <table {TBL}><thead><tr>
+          <th {TH}>代號 / 名稱</th><th {TH}>分點</th>
+          <th {THR}>今/均倍率</th><th {THR}>今日買超</th><th {THR}>收盤價</th>
+        </tr></thead><tbody>{rows_sp}</tbody></table>""" if rows_sp else ""
+
+    footer = (f'<div style="text-align:center;padding:14px;color:#94a3b8;font-size:.72rem">'
+              f'查看完整互動報表 → <a href="{PAGES_URL}" style="color:#3b82f6">{PAGES_URL}</a></div>') if PAGES_URL else ""
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#f1f5f9;margin:0;padding:12px">
+<div style="max-width:640px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">
+  <div style="background:#1a1a2e;color:#fff;padding:16px 20px">
+    <div style="font-size:.95rem;font-weight:700">📊 券商分點大額買進日報</div>
+    <div style="font-size:.75rem;color:#94a3b8;margin-top:3px">{date_disp}</div>
+  </div>
+  <div style="background:#f8fafc;padding:8px 20px;border-bottom:1px solid #e2e8f0;display:flex;gap:16px;flex-wrap:wrap">
+    <span style="font-size:.78rem">🔗 共識 <b style="color:#1d4ed8">{n_cons}</b></span>
+    <span style="font-size:.78rem">📈 連買≥5日 <b style="color:#c2410c">{n_streak5}</b></span>
+    <span style="font-size:.78rem">🟠 強積累 <b style="color:#92400e">{n_strong}</b></span>
+    <span style="font-size:.78rem">🔥 爆量 <b style="color:#dc2626">{n_spike}</b></span>
+  </div>
+  <div style="padding:12px 20px 20px">
+    {cons_html}{streak_html}{strong_html}{spike_html}
+  </div>
+  {footer}
+</div></body></html>"""
+
+
+def send_email(all_branches: list[dict], consensus: list[dict],
+               twse_ohlc: dict, data_date: str):
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]):
         print("⚠️  EMAIL_SENDER/PASSWORD/RECIPIENT 未設定，略過寄信。")
         return
     date_disp = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
+    digest = render_email_digest(all_branches, consensus, twse_ohlc, data_date)
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"券商分點大額買進監控 — {date_disp}"
+    msg["Subject"] = f"📊 券商分點日報 — {date_disp}"
     msg["From"]    = EMAIL_SENDER
     msg["To"]      = EMAIL_RECIPIENT
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(MIMEText(digest, "html", "utf-8"))
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
             smtp.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_bytes())
-        print(f"✅ 已寄送報告至 {EMAIL_RECIPIENT}")
+        print(f"✅ 已寄送日報至 {EMAIL_RECIPIENT}")
     except Exception as e:
         print(f"❌ 寄信失敗：{e}")
 
@@ -1343,7 +1537,7 @@ def main():
         out.write_text(html, "utf-8")
         print(f"\n✅ 已儲存：{out}")
     if do_email:
-        send_email(html, data_date)
+        send_email(all_branches, consensus, twse_ohlc, data_date)
 
 def date_disp(d: str) -> str:
     return f"{d[:4]}/{d[4:6]}/{d[6:]}" if len(d) == 8 else d
