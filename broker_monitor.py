@@ -659,7 +659,8 @@ def apply_strong_accum(all_branches: list[dict], twse_monthly: dict):
 
 HOARD_WINDOW    = 14      # 囤貨觀察窗口（交易日）
 HOARD_MIN_DAYS  = 6       # 窗口內至少買超天數
-HOARD_MIN_TOT   = 30_000  # 窗口累積買超下限（千元），過濾雜訊
+HOARD_MIN_TOT     = 10_000  # 窗口累積買超下限（千元），僅作雜訊下限
+HOARD_MIN_VOL_PCT = 0.5     # 進榜硬性閘門：期間吃貨佔市場成交量 ≥ 0.5%（相對門檻，避免大型股例行流量霸榜）
 HOARD_SCORE_MIN = 60      # 進榜門檻
 
 CONFIRM_WINDOW   = 30      # 30日確認窗口（交易日），輔助訊號：長線是否持續佈局
@@ -740,6 +741,11 @@ def compute_hoarding(all_branches: list[dict], history: list[dict],
         ohlc_all   = twse_ohlc.get(tk, {})
         close_now  = ohlc_all.get(data_date, {}).get("c", 0)
 
+        # 相對佔比硬閘門：有市場量資料時，期間吃貨佔比不足即淘汰。
+        # 大型股被買 5 億可能只佔 0.1%（例行機構流量）→ 擋掉；中小型股被吃 ≥0.5% 才是有感吸籌。
+        if market_sum > 0 and gross_buy / market_sum * 100 < HOARD_MIN_VOL_PCT:
+            continue
+
         raw.append({
             "branch": br, "ticker": tk, "name": name, "no_price": no_price,
             "trading_days": trading_days, "daily_net": daily_net,
@@ -750,10 +756,14 @@ def compute_hoarding(all_branches: list[dict], history: list[dict],
     if not raw:
         return []
 
-    # 分點內排名（前 30%，以 gross_buy 排序）供「隱蔽性」維度使用
+    # 分點內排名（前 30%，以「佔市場量 %」排序）供「隱蔽性」維度使用
+    # 用相對佔比而非絕對金額，避免大型股天然佔據分點內前段
+    def _mkt_pct(r: dict) -> float:
+        return r["gross_buy"] / r["market_sum"] * 100 if r["market_sum"] > 0 else 0.0
+
     branch_groups: dict[str, list[float]] = defaultdict(list)
     for r in raw:
-        branch_groups[r["branch"]].append(r["gross_buy"])
+        branch_groups[r["branch"]].append(_mkt_pct(r))
     branch_p70: dict[str, float] = {}
     for br, vals in branch_groups.items():
         vals_sorted = sorted(vals)
@@ -803,7 +813,7 @@ def compute_hoarding(all_branches: list[dict], history: list[dict],
             # 隱蔽性：分點內買超金額排前 30% 且期間漲幅未大幅反應（漲幅曲線：<=5%滿分，5~15%線性遞減，>15%為0）
             first_c = ohlc_all.get(trading_days[0], {}).get("c", 0)
             period_return_pct = (close_now - first_c) / first_c * 100 if first_c else 0.0
-            rank_ok = r["gross_buy"] >= branch_p70.get(r["branch"], 0)
+            rank_ok = _mkt_pct(r) >= branch_p70.get(r["branch"], 0)
             if rank_ok:
                 if period_return_pct <= 5:
                     stealth_score = 20.0
