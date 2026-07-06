@@ -11,7 +11,7 @@
   python3 broker_monitor.py --remove "名稱"    # 刪除分點
 """
 
-import subprocess, re, os, sys, smtplib, json
+import subprocess, re, os, sys, smtplib, json, time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from collections import defaultdict
@@ -332,18 +332,20 @@ def _roc_to_ymd(roc: str) -> str:
     p = roc.split("/")
     return f"{int(p[0])+1911}{p[1]}{p[2]}"
 
-def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict, dict]:
-    """回傳 (ticker, 當日千元, {yyyymmdd:千元}, {yyyymmdd:{o,h,l,c}} 整月)"""
+def _fetch_twse_month(ticker: str, date_str: str) -> tuple[dict, dict, int]:
+    """抓取單一 ticker 單月資料。回傳 (monthly, monthly_ohlc, last_val)
+    last_val = 該月最後一筆成交金額（千元），供無精確日期比對時的 fallback。"""
     url = TWSE_API.format(date=date_str, ticker=ticker)
+    monthly: dict[str, int] = {}
+    monthly_ohlc: dict[str, dict] = {}
+    last_val = 0
     try:
         out = subprocess.run(
             ['curl', '-s', '--max-time', '10', '-H', 'User-Agent: Mozilla/5.0', url],
             capture_output=True, text=True, timeout=15
         ).stdout
-        data  = json.loads(out)
-        rows  = data.get('data', [])
-        monthly: dict[str, int] = {}
-        monthly_ohlc: dict[str, dict] = {}
+        data = json.loads(out)
+        rows = data.get('data', [])
         for row in rows:
             try:
                 ad = _roc_to_ymd(row[0])
@@ -357,11 +359,38 @@ def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict, dict]
                     }
             except Exception:
                 pass
-        today_val = monthly.get(date_str, (int(rows[-1][2].replace(',', '')) // 1000 if rows else 0))
-        return ticker, today_val, monthly, monthly_ohlc
+        if rows:
+            try:
+                last_val = int(rows[-1][2].replace(',', '')) // 1000
+            except Exception:
+                pass
     except Exception:
         pass
-    return ticker, 0, {}, {}
+    return monthly, monthly_ohlc, last_val
+
+
+def _prev_month_date(date_str: str) -> str:
+    """回傳上個月月份的日期字串（TWSE STOCK_DAY 依年月回傳整月資料，日期取哪天皆可）"""
+    y, m = int(date_str[:4]), int(date_str[4:6])
+    y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+    return f"{y}{m:02d}01"
+
+
+def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict, dict]:
+    """回傳 (ticker, 當日千元, {yyyymmdd:千元}, {yyyymmdd:{o,h,l,c}})。
+    月初（當月不足 14 個交易日）時額外合併上個月資料，供囤貨分數等跨月指標使用。"""
+    monthly, monthly_ohlc, last_val = _fetch_twse_month(ticker, date_str)
+
+    if int(date_str[6:8]) < 20:
+        time.sleep(0.1)
+        prev_monthly, prev_ohlc, _ = _fetch_twse_month(ticker, _prev_month_date(date_str))
+        for d, v in prev_monthly.items():
+            monthly.setdefault(d, v)
+        for d, v in prev_ohlc.items():
+            monthly_ohlc.setdefault(d, v)
+
+    today_val = monthly.get(date_str, last_val)
+    return ticker, today_val, monthly, monthly_ohlc
 
 def fetch_twse_volumes(
     tickers: list[str], date_str: str
@@ -618,6 +647,206 @@ def apply_strong_accum(all_branches: list[dict], twse_monthly: dict):
             mkt_sum = sum(twse_monthly.get(tk, {}).get(d, 0) for d in _dates)
             if mkt_sum > 0 and _buy_g / mkt_sum * 100 >= STRONG_ACCUM_MIN_VOL_PCT:
                 s["is_strong_accum"] = True
+
+HOARD_WINDOW    = 14      # 囤貨觀察窗口（交易日）
+HOARD_MIN_DAYS  = 6       # 窗口內至少買超天數
+HOARD_MIN_TOT   = 30_000  # 窗口累積買超下限（千元），過濾雜訊
+HOARD_SCORE_MIN = 60      # 進榜門檻
+
+def _hoard_window_dates(ticker: str, twse_ohlc: dict, fallback_dates: list[str],
+                        data_date: str) -> tuple[list[str], bool]:
+    """回傳該股近 HOARD_WINDOW 個交易日（舊→新）及是否為無價格資料（如上櫃股）。
+    優先用 TWSE 價格日曆；查無價格資料時退回本地快照日期序列。"""
+    price_days = sorted(d for d in twse_ohlc.get(ticker, {}) if d <= data_date)
+    if price_days:
+        return price_days[-HOARD_WINDOW:], False
+    local_days = sorted(d for d in fallback_dates if d <= data_date)
+    return local_days[-HOARD_WINDOW:], True
+
+
+def compute_hoarding(all_branches: list[dict], history: list[dict],
+                     twse_monthly: dict, twse_ohlc: dict, data_date: str) -> list[dict]:
+    """計算「分點 × 個股」囤貨分數（0~100）。history 由新→舊，已排除今日。
+    五維計分：持續性(25) 逆勢買(25) 隱蔽性(20) 吃貨力度(20) 成本優勢(10)。
+    僅回傳 score ≥ HOARD_SCORE_MIN 的配對，依分數降冪排序。"""
+    if not data_date:
+        return []
+
+    # 快照索引：date → branch → ticker → {net, buy, name}
+    snap_idx: dict[str, dict[str, dict[str, dict]]] = {}
+    for h in history:
+        d = h.get("date")
+        if not d:
+            continue
+        snap_idx[d] = {
+            br: {s["ticker"]: {"net": s["net"], "buy": s["buy"], "name": s["name"]} for s in stocks}
+            for br, stocks in h.get("branches", {}).items()
+        }
+    snap_idx[data_date] = {
+        b["名稱"]: {s["ticker"]: {"net": s["net"], "buy": s["buy"], "name": s["name"]} for s in b["stocks"]}
+        for b in all_branches
+    }
+    all_dates = sorted(snap_idx.keys())
+
+    # 候選配對：近 HOARD_WINDOW 個快照日內曾出現在買超榜的 (分點, 代號)
+    # 僅限目前仍在監控的分點（branches.json），避免已下架分點的舊快照資料混入
+    current_branch_names = {b["名稱"] for b in all_branches}
+    recent_dates = all_dates[-HOARD_WINDOW:]
+    candidates: set[tuple[str, str]] = set()
+    for d in recent_dates:
+        for br, stocks in snap_idx[d].items():
+            if br not in current_branch_names:
+                continue
+            for tk in stocks:
+                candidates.add((br, tk))
+
+    raw: list[dict] = []
+    for br, tk in candidates:
+        trading_days, no_price = _hoard_window_dates(tk, twse_ohlc, all_dates, data_date)
+        if len(trading_days) < HOARD_MIN_DAYS:
+            continue
+        name = ""
+        daily_net: dict[str, int] = {}
+        daily_buy: dict[str, int] = {}
+        for d in trading_days:
+            hit = snap_idx.get(d, {}).get(br, {}).get(tk)
+            if hit:
+                daily_net[d] = hit["net"]
+                daily_buy[d] = hit["buy"]
+                name = hit["name"]
+            else:
+                daily_net[d] = 0
+                daily_buy[d] = 0
+        buy_days  = sum(1 for v in daily_net.values() if v > 0)
+        total_net = sum(v for v in daily_net.values() if v > 0)
+        if buy_days < HOARD_MIN_DAYS or total_net < HOARD_MIN_TOT:
+            continue
+
+        gross_buy  = sum(daily_buy.values())
+        market_sum = sum(twse_monthly.get(tk, {}).get(d, 0) for d in trading_days)
+        ohlc_all   = twse_ohlc.get(tk, {})
+        close_now  = ohlc_all.get(data_date, {}).get("c", 0)
+
+        raw.append({
+            "branch": br, "ticker": tk, "name": name, "no_price": no_price,
+            "trading_days": trading_days, "daily_net": daily_net,
+            "buy_days": buy_days, "total_net": total_net, "gross_buy": gross_buy,
+            "market_sum": market_sum, "close_now": close_now, "ohlc_all": ohlc_all,
+        })
+
+    if not raw:
+        return []
+
+    # 分點內排名（前 30%，以 gross_buy 排序）供「隱蔽性」維度使用
+    branch_groups: dict[str, list[float]] = defaultdict(list)
+    for r in raw:
+        branch_groups[r["branch"]].append(r["gross_buy"])
+    branch_p70: dict[str, float] = {}
+    for br, vals in branch_groups.items():
+        vals_sorted = sorted(vals)
+        idx = max(0, int(len(vals_sorted) * 0.7) - 1)
+        branch_p70[br] = vals_sorted[idx]
+
+    results: list[dict] = []
+    for r in raw:
+        trading_days = r["trading_days"]
+        daily_net    = r["daily_net"]
+        no_price     = r["no_price"]
+        close_now    = r["close_now"]
+
+        # 持續性：買超天數 / HOARD_WINDOW，≥0.6 拿滿分 25
+        persistence_score = 25.0 * min((r["buy_days"] / HOARD_WINDOW) / 0.6, 1.0)
+
+        dip_score = stealth_score = cost_edge_score = 0.0
+        est_shares = est_cost = cost_dev_pct = 0.0
+
+        if not no_price and trading_days:
+            ohlc_all   = r["ohlc_all"]
+            all_sorted = sorted(ohlc_all.keys())
+
+            # 逆勢買：股價收跌日中仍買超的比例
+            down_days = []
+            for d in trading_days:
+                try:
+                    idx = all_sorted.index(d)
+                except ValueError:
+                    continue
+                if idx == 0:
+                    continue
+                prev_c = ohlc_all[all_sorted[idx - 1]]["c"]
+                cur_c  = ohlc_all[d]["c"]
+                if cur_c < prev_c:
+                    down_days.append(d)
+            down_n      = len(down_days)
+            buy_on_down = sum(1 for d in down_days if daily_net.get(d, 0) > 0)
+            if down_n < 3:
+                # 收跌日樣本太少：按比例縮小逆勢買配分，剩餘配分攤給持續性
+                dip_weight = 25.0 * (down_n / 3)
+                dip_score  = dip_weight * (buy_on_down / down_n) if down_n > 0 else 0.0
+                persistence_score = min(25.0, persistence_score + (25.0 - dip_weight))
+            else:
+                dip_score = 25.0 * min((buy_on_down / down_n) / 0.5, 1.0)
+
+            # 隱蔽性：分點內買超金額排前 30% 且期間漲幅未大幅反應（漲幅曲線：<=5%滿分，5~15%線性遞減，>15%為0）
+            first_c = ohlc_all.get(trading_days[0], {}).get("c", 0)
+            period_return_pct = (close_now - first_c) / first_c * 100 if first_c else 0.0
+            rank_ok = r["gross_buy"] >= branch_p70.get(r["branch"], 0)
+            if rank_ok:
+                if period_return_pct <= 5:
+                    stealth_score = 20.0
+                elif period_return_pct >= 15:
+                    stealth_score = 0.0
+                else:
+                    stealth_score = 20.0 * (15 - period_return_pct) / 10
+
+            # 成本優勢：現價相對估計成本的乖離（[-3%,+5%]滿分，向兩側線性遞減至 ±15%）
+            est_shares = sum(
+                daily_net[d] / ohlc_all[d]["c"]
+                for d in trading_days if daily_net.get(d, 0) > 0 and ohlc_all.get(d, {}).get("c")
+            )
+            est_cost = (r["total_net"] / est_shares) if est_shares > 0 else close_now
+            cost_dev_pct = (close_now / est_cost - 1) * 100 if est_cost else 0.0
+            if -3 <= cost_dev_pct <= 5:
+                cost_edge_score = 10.0
+            elif cost_dev_pct > 5:
+                cost_edge_score = 10.0 * max(0.0, (15 - cost_dev_pct) / 10)
+            else:
+                cost_edge_score = 10.0 * max(0.0, (cost_dev_pct + 15) / 12)
+
+        # 吃貨力度：累積買超（毛額）÷ 期間市場成交金額，≥1.0% 滿分 20，≤0.2% 為 0
+        absorption_score = 0.0
+        if r["market_sum"] > 0:
+            ratio = r["gross_buy"] / r["market_sum"] * 100
+            absorption_score = 20.0 * min(max((ratio - 0.2) / 0.8, 0.0), 1.0)
+
+        total_score = min(100.0, persistence_score + dip_score + stealth_score
+                                 + absorption_score + cost_edge_score)
+        if total_score < HOARD_SCORE_MIN:
+            continue
+
+        results.append({
+            "branch": r["branch"], "ticker": r["ticker"], "name": r["name"],
+            "score": round(total_score, 1),
+            "buy_days": r["buy_days"], "window_days": len(trading_days), "total_net": r["total_net"],
+            "est_shares": round(est_shares), "est_cost": round(est_cost, 2),
+            "close": round(close_now, 2), "cost_dev_pct": round(cost_dev_pct, 2),
+            "no_price": no_price,
+            "dims": {
+                "persistence": round(persistence_score, 1), "dip_buying": round(dip_score, 1),
+                "stealth": round(stealth_score, 1), "absorption": round(absorption_score, 1),
+                "cost_edge": round(cost_edge_score, 1),
+            },
+        })
+
+    ticker_branch_count: dict[str, int] = defaultdict(int)
+    for r in results:
+        ticker_branch_count[r["ticker"]] += 1
+    for r in results:
+        r["co_hoard_count"] = ticker_branch_count[r["ticker"]]
+
+    results.sort(key=lambda x: -x["score"])
+    return results
+
 
 def build_consensus(all_branches: list[dict]) -> list[dict]:
     agg = defaultdict(lambda: {
@@ -980,6 +1209,56 @@ def _period_vol_pct_html(buy_gross: int, dates: list[str], ticker: str,
     title   = f"{label}買進 {fmt_n(buy_gross)} ÷ 期間市場 {fmt_n(mkt_sum)} 千元"
     return _vol_html(buy_gross, mkt_sum, title + "（📅期間）")
 
+def _hoard_score_pill(score: float, dims: dict) -> str:
+    cls   = "pill-red" if score >= 80 else "pill-orange"
+    label = "強 " if score >= 80 else ""
+    title = (f"持續性{dims['persistence']} 逆勢買{dims['dip_buying']} "
+             f"隱蔽性{dims['stealth']} 吃貨力度{dims['absorption']} 成本優勢{dims['cost_edge']}")
+    return f'<span class="pill {cls}" title="{title}">{label}{score:.0f}</span>'
+
+def render_hoarding_table(hoarding: list[dict], data_date: str, twse_ohlc: dict) -> str:
+    if not hoarding:
+        return '<p class="hint">目前沒有分點在觀察窗口內達到囤貨分數門檻。</p>'
+    rows = ""
+    for i, r in enumerate(hoarding, 1):
+        tk      = r["ticker"]
+        co_pill = f' <span class="pill pill-blue">{r["co_hoard_count"]}點共囤</span>' if r["co_hoard_count"] >= 2 else ""
+        ohlc5   = _get_recent_ohlc(tk, data_date, twse_ohlc) if not r["no_price"] else []
+        if ohlc5:
+            close   = r["close"]
+            dev     = r["cost_dev_pct"]
+            dev_cls = "price-up" if dev > 0 else "price-dn" if dev < 0 else "price-flat"
+            price_html = (f'<div class="price-cell"><div class="price-info">'
+                          f'<span class="price-val {dev_cls}">{close:,.1f}</span>'
+                          f'<span class="price-chg {dev_cls}">({dev:+.1f}%)</span>'
+                          f'</div>{make_candle_svg(ohlc5)}</div>')
+        else:
+            price_html = '<span class="price-flat">–</span>'
+        est_cost_str = f"{r['est_cost']:.2f}" if r["est_cost"] else "–"
+        rows += f"""<tr>
+          <td class="r" style="color:#bbb;font-size:.72rem;width:28px">{i}</td>
+          <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{r['name']}</span></div>{co_pill}</td>
+          <td>{r['branch']}</td>
+          <td class="r" data-v="{r['score']}">{_hoard_score_pill(r['score'], r['dims'])}</td>
+          <td class="r" data-v="{r['buy_days']}">{r['buy_days']}/{r['window_days']}日</td>
+          <td class="r" data-v="{r['est_shares']}">{fmt_n(r['est_shares'])}</td>
+          <td class="r" data-v="{r['est_cost']}">{est_cost_str}</td>
+          <td data-v="{r['close']}" style="text-align:right">{price_html}</td>
+        </tr>"""
+    return f"""<div class="tbl-wrap"><table>
+      <thead><tr>
+        <th style="width:28px">#</th>
+        <th onclick="sortTable(this)">代號 / 名稱 ↕</th>
+        <th onclick="sortTable(this)">分點 ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)">囤貨分數 ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)">買超天數 ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)">估計吃貨(張) ↕</th>
+        <th class="r" data-num="1" onclick="sortTable(this)">估計成本 ↕</th>
+        <th data-num="1" onclick="sortTable(this)">收盤/K線 ↕</th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table></div>"""
+
 def render_branch_section(br: dict, twse_vol: dict,
                           twse_monthly: dict | None = None,
                           twse_ohlc: dict | None = None,
@@ -1147,7 +1426,7 @@ def _build_modal_divs(all_branches: list[dict]) -> str:
 
 def render_html(all_branches: list[dict], consensus: list[dict],
                 twse_vol: dict, twse_monthly: dict | None = None,
-                twse_ohlc: dict | None = None) -> str:
+                twse_ohlc: dict | None = None, hoarding: list[dict] | None = None) -> str:
     data_date  = next((b["data_date"] for b in all_branches if b.get("data_date")), "")
     date_disp  = f"{data_date[:4]}/{data_date[4:6]}/{data_date[6:]}" if len(data_date)==8 else data_date
     now_utc    = datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")
@@ -1157,6 +1436,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
     accum_list  = [s for b in all_branches for s in b["stocks"] if s.get("is_accumulating")]
     accum_strong = sum(1 for s in accum_list if s.get("is_strong_accum"))
     total_buy_m = sum(s["buy"] for b in all_branches for s in b["stocks"]) // 1_000
+    hoarding    = hoarding or []
 
     modal_divs = _build_modal_divs(all_branches)
 
@@ -1165,6 +1445,8 @@ def render_html(all_branches: list[dict], consensus: list[dict],
       <div class="stat"><div class="lbl">監控分點</div><div class="val">{total_br}</div></div>
       <div class="stat clickable" onclick="showTab('consensus')" title="切換至共識買進分頁">
         <div class="lbl">共識買進</div><div class="val">{len(consensus)}</div><div class="sub">≥2分點同買</div></div>
+      <div class="stat clickable" onclick="showTab('hoarding')" title="切換至囤貨追蹤分頁">
+        <div class="lbl">囤貨追蹤</div><div class="val" style="color:#b91c1c">{len(hoarding)}</div><div class="sub">14日窗口 ↗</div></div>
       <div class="stat clickable" onclick="openSignal('spikes','爆量個股（{len(spike_list)}檔）')" title="點選查看名單">
         <div class="lbl">爆量個股</div><div class="val" style="color:#d93025">{len(spike_list)}</div><div class="sub">≥{int(SPIKE_THRESHOLD*100)}% 均量 ↗</div></div>
       <div class="stat clickable" onclick="openSignal('streak5','連買≥5日（{len(streak_5p)}檔）')" title="點選查看名單">
@@ -1200,12 +1482,19 @@ def render_html(all_branches: list[dict], consensus: list[dict],
   {stats}
   <div class="tabs">
     <button class="tab-btn active" data-tab="consensus" onclick="showTab('consensus')">🔗 共識買進</button>
+    <button class="tab-btn" data-tab="hoarding" onclick="showTab('hoarding')">🎯 囤貨追蹤</button>
     {tab_nav}
   </div>
   <div id="consensus" class="tab-panel active">
     <p class="hint">同時出現在 ≥2 個分點買超（≥{MIN_NET_DISPLAY:,}千元）的股票，按分點數排序。<br>
     佔市場量 = 各分點買進合計 ÷ TWSE當日成交金額。連買天數含今日連續正買超天數。</p>
     {render_consensus_table(consensus, total_br, twse_vol)}
+  </div>
+  <div id="hoarding" class="tab-panel">
+    <p class="hint">囤貨分數（0~100）綜合 14 個交易日內的持續性、逆勢買、隱蔽性、吃貨力度、成本優勢五個維度，
+    偵測分點可能悄悄吸籌的股票；僅 ≥{HOARD_SCORE_MIN} 分進榜。<br>
+    「估計吃貨/成本」為依買超榜金額反推的上限估計值（快照不含賣出資料），僅供參考，非真實持股。</p>
+    {render_hoarding_table(hoarding, data_date, twse_ohlc or {})}
   </div>
   {panels}
 </div>
@@ -1504,6 +1793,9 @@ def main():
     else:
         twse_vol, twse_monthly, twse_ohlc = {}, {}, {}
 
+    # 囤貨分數（14日窗口，偵測分點吸籌行為）
+    hoarding = compute_hoarding(all_branches, history, twse_monthly, twse_ohlc, data_date)
+
     # 共識分析
     consensus = build_consensus(all_branches)
     print(f"\n分析完成：共識 {len(consensus)} 檔，資料日期 {date_disp(data_date)}\n")
@@ -1529,9 +1821,14 @@ def main():
         print(f"\n🟠 積累中（{len(accums)} 筆）：")
         for bn, tk, nm, bd, wd, tot in sorted(accums, key=lambda x: -x[5])[:10]:
             print(f"   {bn} | {tk} {nm} | {bd}/{wd}日 累計+{tot:,}千")
+    print(f"\n🎯 囤貨追蹤：{len(hoarding)} 筆")
+    for r in hoarding[:5]:
+        cost_str = f"{r['est_cost']:.1f}" if r["est_cost"] else "–"
+        close_str = f"{r['close']:.1f}" if r["close"] else "–"
+        print(f"   {r['branch']} | {r['ticker']} {r['name']} | 分數{r['score']:.0f} | 成本{cost_str} vs 現價{close_str}")
 
     # 產生 HTML
-    html = render_html(all_branches, consensus, twse_vol, twse_monthly, twse_ohlc)
+    html = render_html(all_branches, consensus, twse_vol, twse_monthly, twse_ohlc, hoarding)
     if save_file:
         out = SCRIPT_DIR / "index.html"
         out.write_text(html, "utf-8")
