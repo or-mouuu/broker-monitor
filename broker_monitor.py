@@ -32,7 +32,7 @@ TWSE_API      = "https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&
 
 SPIKE_THRESHOLD = 1.5   # 今日買超 / 五日均 ≥ 150% → 爆量
 MIN_NET_DISPLAY = 3_000  # 最低顯示門檻（千元）
-MAX_HISTORY     = 20     # 最多回溯交易日數
+MAX_HISTORY     = 32     # 最多回溯交易日數（含 30日確認窗口所需緩衝）
 
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "or.mouuu@gmail.com")
 EMAIL_SENDER    = os.getenv("EMAIL_SENDER",    "")
@@ -378,10 +378,11 @@ def _prev_month_date(date_str: str) -> str:
 
 def _fetch_one_volume(ticker: str, date_str: str) -> tuple[str, int, dict, dict]:
     """回傳 (ticker, 當日千元, {yyyymmdd:千元}, {yyyymmdd:{o,h,l,c}})。
-    月初（當月不足 14 個交易日）時額外合併上個月資料，供囤貨分數等跨月指標使用。"""
+    單月最多僅約 20 個交易日，不足以支撐 30 日確認窗口，故當月資料不足時
+    一律額外合併上個月資料，供囤貨分數 14日/30日 等跨月指標使用。"""
     monthly, monthly_ohlc, last_val = _fetch_twse_month(ticker, date_str)
 
-    if int(date_str[6:8]) < 20:
+    if len(monthly) < CONFIRM_WINDOW:
         time.sleep(0.1)
         prev_monthly, prev_ohlc, _ = _fetch_twse_month(ticker, _prev_month_date(date_str))
         for d, v in prev_monthly.items():
@@ -653,15 +654,19 @@ HOARD_MIN_DAYS  = 6       # 窗口內至少買超天數
 HOARD_MIN_TOT   = 30_000  # 窗口累積買超下限（千元），過濾雜訊
 HOARD_SCORE_MIN = 60      # 進榜門檻
 
+CONFIRM_WINDOW   = 30      # 30日確認窗口（交易日），輔助訊號：長線是否持續佈局
+CONFIRM_MIN_DAYS = 12      # 30日窗口內至少買超天數（≈40%）
+CONFIRM_MIN_TOT  = 60_000  # 30日窗口累積買超下限（千元）
+
 def _hoard_window_dates(ticker: str, twse_ohlc: dict, fallback_dates: list[str],
-                        data_date: str) -> tuple[list[str], bool]:
-    """回傳該股近 HOARD_WINDOW 個交易日（舊→新）及是否為無價格資料（如上櫃股）。
+                        data_date: str, window: int = HOARD_WINDOW) -> tuple[list[str], bool]:
+    """回傳該股近 window 個交易日（舊→新）及是否為無價格資料（如上櫃股）。
     優先用 TWSE 價格日曆；查無價格資料時退回本地快照日期序列。"""
     price_days = sorted(d for d in twse_ohlc.get(ticker, {}) if d <= data_date)
     if price_days:
-        return price_days[-HOARD_WINDOW:], False
+        return price_days[-window:], False
     local_days = sorted(d for d in fallback_dates if d <= data_date)
-    return local_days[-HOARD_WINDOW:], True
+    return local_days[-window:], True
 
 
 def compute_hoarding(all_branches: list[dict], history: list[dict],
@@ -843,6 +848,23 @@ def compute_hoarding(all_branches: list[dict], history: list[dict],
         ticker_branch_count[r["ticker"]] += 1
     for r in results:
         r["co_hoard_count"] = ticker_branch_count[r["ticker"]]
+
+    # 30日確認：僅對已進榜的配對計算，作為長線佈局的輔助信心標記（不影響原始 14 日分數）
+    for r in results:
+        br, tk = r["branch"], r["ticker"]
+        trading_days_30, _ = _hoard_window_dates(tk, twse_ohlc, all_dates, data_date, CONFIRM_WINDOW)
+        buy_days_30  = 0
+        total_net_30 = 0
+        for d in trading_days_30:
+            hit = snap_idx.get(d, {}).get(br, {}).get(tk)
+            if hit and hit["net"] > 0:
+                buy_days_30  += 1
+                total_net_30 += hit["net"]
+        r["confirm_30d"] = (
+            len(trading_days_30) >= CONFIRM_MIN_DAYS
+            and buy_days_30 >= CONFIRM_MIN_DAYS
+            and total_net_30 >= CONFIRM_MIN_TOT
+        )
 
     results.sort(key=lambda x: -x["score"])
     return results
@@ -1268,6 +1290,7 @@ def render_hoarding_table(hoarding: list[dict], data_date: str, twse_ohlc: dict)
     for i, r in enumerate(hoarding, 1):
         tk      = r["ticker"]
         co_pill = f' <span class="pill pill-blue">{r["co_hoard_count"]}點共囤</span>' if r["co_hoard_count"] >= 2 else ""
+        confirm_pill = ' <span class="pill pill-green" title="30日窗口內買超天數/總量同樣達標">長線佈局</span>' if r.get("confirm_30d") else ""
         ohlc5   = _get_recent_ohlc(tk, data_date, twse_ohlc) if not r["no_price"] else []
         if ohlc5:
             close   = r["close"]
@@ -1282,7 +1305,7 @@ def render_hoarding_table(hoarding: list[dict], data_date: str, twse_ohlc: dict)
         est_cost_str = f"{r['est_cost']:.2f}" if r["est_cost"] else "–"
         rows += f"""<tr>
           <td class="r" style="color:#bbb;font-size:.72rem;width:28px">{i}</td>
-          <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{r['name']}</span></div>{co_pill}</td>
+          <td><div class="tk"><span class="tk-code">{tk}</span><span class="tk-name">{r['name']}</span></div>{co_pill}{confirm_pill}</td>
           <td>{r['branch']}</td>
           <td class="r" data-v="{r['score']}">{_hoard_score_pill(r['score'], r['dims'])}</td>
           <td class="r" data-v="{r['buy_days']}">{r['buy_days']}/{r['window_days']}日</td>
@@ -1537,7 +1560,7 @@ def render_html(all_branches: list[dict], consensus: list[dict],
   </div>
   <div id="hoarding" class="tab-panel">
     <p class="hint">囤貨分數（0~100）綜合 14 個交易日內的持續性、逆勢買、隱蔽性、吃貨力度、成本優勢五個維度，
-    偵測分點可能悄悄吸籌的股票；僅 ≥{HOARD_SCORE_MIN} 分進榜。<br>
+    偵測分點可能悄悄吸籌的股票；僅 ≥{HOARD_SCORE_MIN} 分進榜。「長線佈局」標記表示 30 日窗口內買超天數/總量同樣達標，屬於信心加分，不影響主分數。<br>
     「估計吃貨/成本」為依買超榜金額反推的上限估計值（快照不含賣出資料），僅供參考，非真實持股。</p>
     {render_hoarding_table(hoarding, data_date, twse_ohlc or {})}
   </div>
@@ -1680,6 +1703,8 @@ def render_email_digest(all_branches: list[dict], consensus: list[dict],
             extra += pill_s("NEW", "#dc2626", "#ffffff")
         if r.get("co_hoard_count", 0) >= 2:
             extra += pill_s(f'{r["co_hoard_count"]}點共囤', "#dbeafe", "#1d4ed8")
+        if r.get("confirm_30d"):
+            extra += pill_s("長線佈局", "#f0fdf4", "#15803d")
         dev      = r.get("cost_dev_pct", 0)
         dev_col  = "#dc2626" if dev > 0 else "#16a34a" if dev < 0 else "#64748b"
         cost_html = f'<span style="color:{dev_col};font-weight:600">{dev:+.1f}%</span>' if r.get("est_cost") else "–"
